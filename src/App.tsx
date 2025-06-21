@@ -406,7 +406,7 @@ const App: React.FC = () => {
               <Github className="w-5 h-5 text-white" />
             </a>
             <a
-              href="https://linkedin.com"
+              href="https://www.linkedin.com/in/othniel-konan-a54b4b242/"
               target="_blank"
               rel="noopener noreferrer"
               className="p-3 bg-slate-700/50 hover:bg-slate-600/50 rounded-lg transition-colors"
