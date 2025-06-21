@@ -398,7 +398,7 @@ const App: React.FC = () => {
           </div>
           <div className="flex items-center space-x-4">
             <a
-              href="https://github.com"
+              href="https://github.com/Matheux14/Smart-PDF-I-Gen/blob/main/src/App.tsx"
               target="_blank"
               rel="noopener noreferrer"
               className="p-3 bg-slate-700/50 hover:bg-slate-600/50 rounded-lg transition-colors"
