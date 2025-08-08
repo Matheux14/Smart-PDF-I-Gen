@@ -1,5 +1,4 @@
 {
-  "projects": {},
   "rewrites": [
     {
       "source": "/api/(.*)",
