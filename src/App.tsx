@@ -27,7 +27,6 @@ const examplePdfs = [
 
 // --- UTILS ---
 function parseSections(raw: string) {
-  // Split each section starting by "**Title**"
   const regex = /\*\*(.+?)\*\*/g;
   let match;
   let lastIndex = 0;
@@ -57,6 +56,9 @@ function parseSections(raw: string) {
 const PAYWALL_PAGES = 30;
 const PAYWALL_WORDS = 50000;
 const KO_FI_LINK = "https://ko-fi.com/konanothniel155";
+
+// Utilise l'URL d'API selon l'environnement
+const API_URL = import.meta.env.VITE_API_URL || "http://localhost:8000";
 
 const App: React.FC = () => {
   const [isDragOver, setIsDragOver] = useState(false);
@@ -128,7 +130,7 @@ const App: React.FC = () => {
       formData.append("file", uploadedFile);
 
       const res = await axios.post(
-        "/api/summarize", // Use relative path for deployment (proxy)
+        `${API_URL}/api/summarize`,
         formData,
         { headers: { "Content-Type": "multipart/form-data" } }
       );
@@ -141,7 +143,6 @@ const App: React.FC = () => {
       setNbPages(res.data.nb_pages || null);
       setPaywall(res.data.paywall || false);
     } catch (err: any) {
-      // Test if backend returned paywall
       const paywallResponse = err?.response?.data?.paywall;
       if (paywallResponse) {
         setPaywall(true);
@@ -151,7 +152,7 @@ const App: React.FC = () => {
       } else {
         setError(
           err?.response?.data?.error ||
-            "PDF analysis failed. Please try again or use a smaller file."
+          "PDF analysis failed. Please try again or use a smaller file."
         );
       }
     } finally {

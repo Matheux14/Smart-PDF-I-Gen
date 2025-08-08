@@ -16,10 +16,13 @@ app = FastAPI()
 
 # CORS config
 origins = [
+    "http://localhost:5173",              # Pour le dev local
+    "https://smart-pdf-i-gen.vercel.app", # Ton déploiement Vercel (ou adapte)
     "https://summarizeai.com",
     "https://www.summarizeai.com",
-    "https://summarizeai.vercel.app"
+    "https://smart-pdf-i-gen-1.onrender.com"
 ]
+
 
 app.add_middleware(
     CORSMiddleware,
