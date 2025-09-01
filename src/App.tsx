@@ -16,6 +16,10 @@ import {
   Zap,
   Eye,
   ShieldCheck,
+  CheckCircle2,
+  Target,
+  Lightbulb,
+  MessageSquare,
 } from "lucide-react";
 
 /* =========================
@@ -56,15 +60,13 @@ function parseSections(raw: string) {
 const PAYWALL_PAGES = 30;
 const PAYWALL_WORDS = 50000;
 const KO_FI_LINK = "https://ko-fi.com/konanothniel155";
-
-// IMPORTANT : même clé d'env que côté déploiement
 const API_URL =
-  import.meta.env.VITE_API_BASE_URL || "https://smart-pdf-i-gen-1.onrender.com";
+  import.meta.env.VITE_API_BASE_URL ||
+  "https://smart-pdf-i-gen-1.onrender.com";
 
 /* =========================
-   Helpers
+   Server validation helpers
 ========================= */
-// Validation côté serveur du token admin
 async function validateAdmin(): Promise<boolean> {
   const token = localStorage.getItem("ADMIN_BYPASS_TOKEN");
   if (!token) return false;
@@ -77,6 +79,59 @@ async function validateAdmin(): Promise<boolean> {
     return false;
   }
 }
+async function validatePremium(): Promise<boolean> {
+  const token = localStorage.getItem("PREMIUM_TOKEN");
+  if (!token) return false;
+  try {
+    const r = await axios.get(`${API_URL}/auth/premium/check`, {
+      headers: { "x-premium-token": token },
+    });
+    return !!r.data?.premium;
+  } catch {
+    return false;
+  }
+}
+
+/* =========================
+   Pretty Section Card
+========================= */
+function sectionIcon(title: string) {
+  const t = title.toLowerCase();
+  if (t.includes("executive")) return <Lightbulb className="w-5 h-5 text-amber-300" />;
+  if (t.includes("key") || t.includes("results")) return <Target className="w-5 h-5 text-sky-300" />;
+  if (t.includes("recommend")) return <CheckCircle2 className="w-5 h-5 text-emerald-300" />;
+  return <FileText className="w-5 h-5 text-indigo-300" />;
+}
+
+const SectionCard: React.FC<{ title?: string; children: React.ReactNode }> = ({
+  title,
+  children,
+}) => {
+  const accent =
+    title?.toLowerCase().includes("executive")
+      ? "from-amber-500/15 to-rose-500/10"
+      : title?.toLowerCase().includes("recommend")
+      ? "from-emerald-500/15 to-teal-500/10"
+      : title?.toLowerCase().includes("key")
+      ? "from-sky-500/15 to-indigo-500/10"
+      : "from-slate-500/10 to-slate-500/5";
+
+  return (
+    <div
+      className={`rounded-2xl p-4 bg-gradient-to-br ${accent} border border-white/10 shadow-[0_6px_24px_rgba(0,0,0,.25)] transition-transform duration-150 hover:-translate-y-0.5`}
+    >
+      {title && (
+        <div className="flex items-center gap-2 mb-2">
+          {sectionIcon(title)}
+          <div className="font-semibold text-lg text-white">{title}</div>
+        </div>
+      )}
+      <div className="prose prose-invert max-w-none text-[15px] leading-relaxed">
+        {children}
+      </div>
+    </div>
+  );
+};
 
 /* =========================
    Component
@@ -96,14 +151,22 @@ const App: React.FC = () => {
   const [copied, setCopied] = useState(false);
   const [paywall, setPaywall] = useState(false);
 
-  // Admin (validé par le serveur)
+  // Admin / Premium (confirmés par le serveur)
   const [adminOn, setAdminOn] = useState<boolean>(false);
+  const [premiumOn, setPremiumOn] = useState<boolean>(false);
+
+  // Q&A
+  const [docId, setDocId] = useState<string>("");
+  const [question, setQuestion] = useState("");
+  const [answer, setAnswer] = useState("");
+  const [qaLoading, setQaLoading] = useState(false);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
-    // Au chargement, on demande au serveur si le token local est valide
+    // Valider tokens au chargement
     validateAdmin().then(setAdminOn);
+    validatePremium().then(setPremiumOn);
   }, []);
 
   /* ---------- Drag & Drop ---------- */
@@ -143,6 +206,9 @@ const App: React.FC = () => {
     setNbPages(null);
     setWordCount(0);
     setProcessingTime("");
+    setAnswer("");
+    setQuestion("");
+    setDocId("");
   }
 
   /* ---------- Upload & Summarize ---------- */
@@ -157,10 +223,12 @@ const App: React.FC = () => {
       const formData = new FormData();
       formData.append("file", uploadedFile);
 
-      // Header admin si présent
+      // Headers (admin + premium)
       const headers: Record<string, string> = { "Content-Type": "multipart/form-data" };
-      const token = localStorage.getItem("ADMIN_BYPASS_TOKEN");
-      if (token) headers["x-admin-token"] = token;
+      const adminTok = localStorage.getItem("ADMIN_BYPASS_TOKEN");
+      const premTok = localStorage.getItem("PREMIUM_TOKEN");
+      if (adminTok) headers["x-admin-token"] = adminTok;
+      if (premTok) headers["x-premium-token"] = premTok;
 
       const res = await axios.post(`${API_URL}/api/summarize`, formData, { headers });
       const t1 = performance.now();
@@ -171,6 +239,11 @@ const App: React.FC = () => {
       setWordCount(res.data.nb_words || 0);
       setNbPages(res.data.nb_pages ?? null);
       setPaywall(!!res.data.paywall);
+      if (res.data.doc_id) setDocId(res.data.doc_id);
+
+      // Si le serveur confirme, synchroniser l'état
+      if (res.data.admin_bypass === true) setAdminOn(true);
+      if (res.data.premium === true) setPremiumOn(true);
     } catch (err: any) {
       const paywallResponse = err?.response?.data?.paywall;
       if (paywallResponse) {
@@ -180,11 +253,40 @@ const App: React.FC = () => {
         setError("");
       } else {
         setError(
-          err?.response?.data?.error || "PDF analysis failed. Please try again or use a smaller file."
+          err?.response?.data?.error ||
+            "PDF analysis failed. Please try again or use a smaller file."
         );
       }
     } finally {
       setIsProcessing(false);
+    }
+  };
+
+  /* ---------- Q&A ---------- */
+  const handleAsk = async () => {
+    if (!question.trim()) return;
+    setQaLoading(true);
+    setAnswer("");
+    setError("");
+
+    try {
+      const headers: Record<string, string> = { "Content-Type": "application/json" };
+      const adminTok = localStorage.getItem("ADMIN_BYPASS_TOKEN");
+      const premTok = localStorage.getItem("PREMIUM_TOKEN");
+      if (adminTok) headers["x-admin-token"] = adminTok;
+      if (premTok) headers["x-premium-token"] = premTok;
+
+      const body: any = { question: question.trim() };
+      if (docId) body.doc_id = docId;
+      else body.context_hint = (aiSummary || summaryRaw || "").slice(0, 6000); // fallback
+
+      const r = await axios.post(`${API_URL}/api/ask`, body, { headers });
+      setAnswer(r.data?.answer || "");
+    } catch (e: any) {
+      setAnswer("");
+      setError(e?.response?.data?.error || "Q&A failed. Premium may be required.");
+    } finally {
+      setQaLoading(false);
     }
   };
 
@@ -209,7 +311,7 @@ const App: React.FC = () => {
         className="
           w-full max-w-4xl mx-auto
           rounded-2xl border border-white/10
-          bg-gradient-to-br from-fuchsia-500/10 via-indigo-500/10 to-cyan-400/10
+          bg-gradient-to-br from-fuchsia-500/15 via-indigo-500/10 to-cyan-400/10
           p-4 sm:p-5 lg:p-6 shadow-[0_6px_24px_rgba(0,0,0,.25)]
           flex flex-wrap items-center gap-3 sm:gap-4
         "
@@ -279,7 +381,7 @@ const App: React.FC = () => {
     </div>
   );
 
-  /* ---------- Admin pill ---------- */
+  /* ---------- Admin / Premium pills ---------- */
   const AdminPill = () => (
     <button
       onClick={async () => {
@@ -292,7 +394,10 @@ const App: React.FC = () => {
             localStorage.setItem("ADMIN_BYPASS_TOKEN", t.trim());
             const ok = await validateAdmin();
             setAdminOn(ok);
-            if (!ok) alert("Invalid token.");
+            if (!ok) {
+              alert("Invalid admin token.");
+              localStorage.removeItem("ADMIN_BYPASS_TOKEN");
+            }
           }
         }
       }}
@@ -305,6 +410,37 @@ const App: React.FC = () => {
       Admin: {adminOn ? "ON" : "OFF"}
     </button>
   );
+
+  const PremiumPill = () => (
+    <button
+      onClick={async () => {
+        if (premiumOn) {
+          localStorage.removeItem("PREMIUM_TOKEN");
+          setPremiumOn(false);
+        } else {
+          const t = prompt("Enter premium token");
+          if (t && t.trim()) {
+            localStorage.setItem("PREMIUM_TOKEN", t.trim());
+            const ok = await validatePremium();
+            setPremiumOn(ok);
+            if (!ok) {
+              alert("Invalid premium token.");
+              localStorage.removeItem("PREMIUM_TOKEN");
+            }
+          }
+        }
+      }}
+      className={`inline-flex items-center gap-2 px-3 py-1.5 rounded-full border text-sm font-semibold
+        ${premiumOn ? "border-fuchsia-400/40 text-fuchsia-300 bg-fuchsia-600/10" : "border-white/15 text-slate-300 bg-white/5"}
+      `}
+      title="Toggle premium"
+    >
+      <ShieldCheck className="w-4 h-4" />
+      Premium: {premiumOn ? "ON" : "OFF"}
+    </button>
+  );
+
+  const hasPremium = adminOn || premiumOn;
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-[#232E45] to-[#1C2030] text-white flex flex-col">
@@ -325,13 +461,16 @@ const App: React.FC = () => {
             </div>
           </div>
 
-          {/* Admin switch (discret) */}
-          <AdminPill />
+          {/* Switches */}
+          <div className="flex gap-2">
+            <PremiumPill />
+            <AdminPill />
+          </div>
         </div>
       </header>
 
-      {/* Premium Banner — masquée pour l'admin validé */}
-      {!adminOn && <PremiumBanner />}
+      {/* Premium Banner (masquée si admin/premium confirmé) */}
+      {!hasPremium && <PremiumBanner />}
 
       {/* Main */}
       <main className="flex-1 max-w-7xl mx-auto px-6 pb-16 w-full">
@@ -436,7 +575,7 @@ const App: React.FC = () => {
             </div>
           </div>
 
-          {/* Right: Summary */}
+          {/* Right: Summary + Q&A */}
           <div className="bg-[#232840] rounded-2xl shadow-lg p-6 sm:p-8 flex flex-col">
             <div className="flex items-center justify-between mb-6">
               <div className="flex items-center">
@@ -457,17 +596,11 @@ const App: React.FC = () => {
                 {copied && <span className="text-green-400 text-sm">Copied!</span>}
                 <button
                   onClick={() => {
-                    setSummaryRaw("");
-                    setAiSummary("");
+                    resetAll();
                     setUploadedFile(null);
-                    setError("");
-                    setPaywall(false);
-                    setNbPages(null);
-                    setWordCount(0);
-                    setProcessingTime("");
                   }}
                   className="p-2 bg-[#283353] hover:bg-[#314066] rounded-lg"
-                  title="Refresh"
+                  title="Reset"
                 >
                   <RefreshCw className="w-4 h-4" />
                 </button>
@@ -477,33 +610,59 @@ const App: React.FC = () => {
             {/* Error */}
             {error && <div className="bg-red-500/90 text-white p-3 rounded mb-4">{error}</div>}
 
-            {/* Paywall — masqué pour l'admin validé */}
-            {paywall && !adminOn && <PaywallNotice />}
+            {/* Paywall (masqué si admin/premium) */}
+            {paywall && !hasPremium && <PaywallNotice />}
 
             {/* Summary */}
             {!paywall && (
-              <div className="space-y-6 mb-6 max-h-[320px] overflow-y-auto px-1 sm:px-2">
+              <div className="space-y-4 mb-6 max-h-[320px] overflow-y-auto px-1 sm:px-2">
                 {!aiSummary && !summaryRaw && !isProcessing && !error && (
                   <div className="text-slate-400 italic">No summary yet. Upload a PDF to start.</div>
                 )}
                 {(aiSummary || summaryRaw) &&
                   parseSections(aiSummary || summaryRaw).map((section, idx) => (
-                    <div
-                      key={idx}
-                      className={`rounded-xl shadow ${
-                        section.title ? "bg-[#222a3b] p-4" : "bg-transparent text-base px-2 py-1"
-                      }`}
-                    >
-                      {section.title && (
-                        <div className="font-bold text-lg mb-2 text-indigo-200">{section.title}</div>
-                      )}
-                      <div className="prose prose-invert max-w-none text-base">
-                        <ReactMarkdown remarkPlugins={[remarkMath]} rehypePlugins={[rehypeKatex]}>
-                          {section.content}
-                        </ReactMarkdown>
-                      </div>
-                    </div>
+                    <SectionCard key={idx} title={section.title || undefined}>
+                      <ReactMarkdown remarkPlugins={[remarkMath]} rehypePlugins={[rehypeKatex]}>
+                        {section.content}
+                      </ReactMarkdown>
+                    </SectionCard>
                   ))}
+              </div>
+            )}
+
+            {/* Q&A (premium/admin only) */}
+            {hasPremium && !paywall && (
+              <div className="mt-4 rounded-2xl p-4 border border-white/10 bg-gradient-to-br from-violet-500/10 to-indigo-500/10">
+                <div className="flex items-center gap-2 mb-2">
+                  <MessageSquare className="w-5 h-5 text-violet-300" />
+                  <div className="font-semibold text-white">Ask questions about this PDF</div>
+                </div>
+                <div className="flex flex-col sm:flex-row gap-3">
+                  <input
+                    value={question}
+                    onChange={(e) => setQuestion(e.target.value)}
+                    placeholder="Ask a precise question..."
+                    className="flex-1 rounded-xl bg-[#1e2540] border border-white/10 px-3 py-2 outline-none focus:ring-2 ring-indigo-500/40"
+                  />
+                  <button
+                    onClick={handleAsk}
+                    disabled={!question.trim() || qaLoading}
+                    className={`px-4 py-2 rounded-xl font-semibold ${
+                      !question.trim() || qaLoading
+                        ? "bg-indigo-900/60 text-[#b7cbfa] cursor-not-allowed"
+                        : "bg-indigo-600 hover:bg-indigo-500 text-white"
+                    }`}
+                  >
+                    {qaLoading ? "Thinking..." : "Ask AI"}
+                  </button>
+                </div>
+                {answer && (
+                  <div className="mt-3 p-3 rounded-xl bg-[#1e2540] border border-white/10 text-[15px] leading-relaxed">
+                    <ReactMarkdown remarkPlugins={[remarkMath]} rehypePlugins={[rehypeKatex]}>
+                      {answer}
+                    </ReactMarkdown>
+                  </div>
+                )}
               </div>
             )}
 
@@ -535,7 +694,9 @@ const App: React.FC = () => {
           <div className="text-center md:text-left">
             <span className="text-lg font-semibold text-white">Smart PDF AI</span>
             <span className="mx-2 text-slate-400">|</span>
-            <span className="text-slate-400">© {new Date().getFullYear()} summarizeai.com</span>
+            <span className="text-slate-400">
+              © {new Date().getFullYear()} summarizeai.com
+            </span>
           </div>
           <div className="text-center md:text-right text-slate-400 text-sm">
             For support:{" "}

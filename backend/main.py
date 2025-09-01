@@ -4,20 +4,26 @@ from fastapi.responses import JSONResponse
 import tempfile
 import os
 import fitz  # PyMuPDF
+import uuid
 
 from dotenv import load_dotenv
 load_dotenv()
 
-# --- Limites gratuites via ENV (modifiable sur Render) ---
+# ------- Free limits -------
 FREE_PAGE_LIMIT = int(os.getenv("FREE_PAGE_LIMIT", "30"))
 FREE_WORD_LIMIT = int(os.getenv("FREE_WORD_LIMIT", "50000"))
 
-# --- Admin bypass token (Render -> Environment) ---
+# ------- Tokens (Render -> Environment) -------
 ADMIN_BYPASS_TOKEN = os.getenv("ADMIN_BYPASS_TOKEN")
+# PREMIUM_TOKENS: liste de tokens premium séparés par des virgules
+PREMIUM_TOKENS = [t.strip() for t in os.getenv("PREMIUM_TOKENS", "").split(",") if t.strip()]
+
+# ------- In-memory doc store (MVP) -------
+# doc_id -> {"text": str, "pages": int, "words": int}
+DOC_STORE = {}
 
 app = FastAPI(title="Smart PDF I-Gen Backend")
 
-# --- CORS ---
 origins = [
     "http://localhost:5173",
     "http://127.0.0.1:5173",
@@ -28,90 +34,18 @@ app.add_middleware(
     allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
-    allow_headers=["*"],  # x-admin-token autorisé
+    allow_headers=["*"],  # permet x-admin-token / x-premium-token
 )
 
-@app.get("/ping")
-def ping():
-    return {"pong": True, "model": os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")}
+# ---------- Helpers ----------
+def is_admin(request: Request) -> bool:
+    if not ADMIN_BYPASS_TOKEN:
+        return False
+    return request.headers.get("x-admin-token", "") == ADMIN_BYPASS_TOKEN
 
-# --- Nouveau : endpoint de validation admin ---
-@app.get("/auth/check")
-def auth_check(request: Request):
-    token = request.headers.get("x-admin-token")
-    ok = bool(ADMIN_BYPASS_TOKEN) and (token == ADMIN_BYPASS_TOKEN)
-    return {"admin": ok}
-
-@app.post("/api/summarize")
-async def summarize_pdf(request: Request, file: UploadFile = File(...)):
-    """
-    Upload PDF -> extract -> simple + AI summary.
-    Admin bypass: si x-admin-token valide, ignore les limites gratuites.
-    """
-    tmp_path = None
-    doc = None
-
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-            content = await file.read()
-            tmp.write(content)
-            tmp_path = tmp.name
-
-        doc = fitz.open(tmp_path)
-        full_text_parts = [page.get_text() for page in doc]
-        nb_pages = doc.page_count
-        full_text = " ".join(full_text_parts)
-        nb_words = len(full_text.split())
-
-        if not full_text.strip():
-            return JSONResponse({"error": "The PDF is empty or unreadable."}, status_code=400)
-
-        # --- Admin bypass ---
-        is_admin = bool(ADMIN_BYPASS_TOKEN) and (
-            request.headers.get("x-admin-token") == ADMIN_BYPASS_TOKEN
-        )
-
-        # Paywall (s’applique seulement si pas admin)
-        if (nb_pages > FREE_PAGE_LIMIT or nb_words > FREE_WORD_LIMIT) and not is_admin:
-            return JSONResponse(
-                {
-                    "error": f"This document exceeds the free limit ({FREE_PAGE_LIMIT} pages or {FREE_WORD_LIMIT} words).",
-                    "paywall": True,
-                    "nb_pages": nb_pages,
-                    "nb_words": nb_words,
-                },
-                status_code=402,
-            )
-
-        # Résumé simple
-        summary = simple_summarizer(full_text)
-        # Résumé IA
-        ai_summary = smart_groq_summary(full_text)
-
-        return {
-            "summary": summary,
-            "ai_summary": ai_summary,
-            "nb_pages": nb_pages,
-            "nb_words": nb_words,
-            "paywall": False,
-            "admin_bypass": is_admin,
-        }
-
-    except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
-    finally:
-        try:
-            if doc is not None:
-                doc.close()
-        except Exception:
-            pass
-        try:
-            if tmp_path and os.path.exists(tmp_path):
-                os.remove(tmp_path)
-        except Exception:
-            pass
-
-# ------------------ Helpers ------------------
+def is_premium(request: Request) -> bool:
+    tok = request.headers.get("x-premium-token", "")
+    return bool(tok and tok in PREMIUM_TOKENS)
 
 def simple_summarizer(text: str, max_sentences: int = 3) -> str:
     import re
@@ -119,12 +53,8 @@ def simple_summarizer(text: str, max_sentences: int = 3) -> str:
     return " ".join(sentences[:max_sentences])
 
 def smart_groq_summary(text: str) -> str:
-    """
-    Appel Groq via endpoint OpenAI-compatible.
-    SDK OpenAI -> utiliser max_tokens.
-    """
+    """Résumé IA via Groq (endpoint OpenAI-compatible)."""
     import openai
-
     api_key = os.environ.get("GROQ_API_KEY", "")
     if not api_key:
         return "[Groq Error] No API key defined"
@@ -145,19 +75,166 @@ def smart_groq_summary(text: str) -> str:
     )
 
     try:
-        client = openai.OpenAI(
-            api_key=api_key,
-            base_url="https://api.groq.com/openai/v1",
-        )
+        client = openai.OpenAI(api_key=api_key, base_url="https://api.groq.com/openai/v1")
         resp = client.chat.completions.create(
             model=model,
             messages=[
                 {"role": "system", "content": "You are an expert at summarizing professional and academic documents in all languages."},
                 {"role": "user", "content": prompt},
             ],
-            max_tokens=600,   # (SDK OpenAI)
+            max_tokens=600,
             temperature=0.2,
         )
         return (resp.choices[0].message.content or "").strip()
     except Exception as e:
         return f"[Groq Error] {e}"
+
+def smart_groq_qa(context: str, question: str) -> str:
+    """Q&A sur le document via Groq."""
+    import openai
+    api_key = os.environ.get("GROQ_API_KEY", "")
+    if not api_key:
+        return "[Groq Error] No API key defined"
+    model = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+
+    # Contexte tronqué pour rester safe
+    ctx = context[:7000]
+    user = (
+        "Answer the question strictly using the provided PDF context. "
+        "Cite section names if they appear. Be concise and structured.\n\n"
+        f"Question: {question}\n\n"
+        f"PDF Context:\n{ctx}"
+    )
+    try:
+        client = openai.OpenAI(api_key=api_key, base_url="https://api.groq.com/openai/v1")
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant for answering questions about a PDF."},
+                {"role": "user", "content": user},
+            ],
+            max_tokens=500,
+            temperature=0.2,
+        )
+        return (resp.choices[0].message.content or "").strip()
+    except Exception as e:
+        return f"[Groq Error] {e}"
+
+# ---------- Health ----------
+@app.get("/ping")
+def ping():
+    return {"pong": True, "model": os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")}
+
+# ---------- Auth check ----------
+@app.get("/auth/check")
+def auth_check(request: Request):
+    return {"admin": is_admin(request)}
+
+@app.get("/auth/premium/check")
+def premium_check(request: Request):
+    return {"premium": is_premium(request)}
+
+# ---------- Summarize ----------
+@app.post("/api/summarize")
+async def summarize_pdf(request: Request, file: UploadFile = File(...)):
+    """
+    Upload PDF -> extract -> simple + AI summary.
+    - Stocke le texte en mémoire et renvoie doc_id
+    - Bypass paywall si admin OU premium
+    """
+    tmp_path = None
+    doc = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+            content = await file.read()
+            tmp.write(content)
+            tmp_path = tmp.name
+
+        doc = fitz.open(tmp_path)
+        full_text_parts = [page.get_text() for page in doc]
+        nb_pages = doc.page_count
+        full_text = " ".join(full_text_parts)
+        nb_words = len(full_text.split())
+
+        if not full_text.strip():
+            return JSONResponse({"error": "The PDF is empty or unreadable."}, status_code=400)
+
+        admin_ok = is_admin(request)
+        premium_ok = is_premium(request)
+
+        # Paywall si ni admin ni premium
+        if (nb_pages > FREE_PAGE_LIMIT or nb_words > FREE_WORD_LIMIT) and not (admin_ok or premium_ok):
+            return JSONResponse(
+                {
+                    "error": f"This document exceeds the free limit ({FREE_PAGE_LIMIT} pages or {FREE_WORD_LIMIT} words).",
+                    "paywall": True,
+                    "nb_pages": nb_pages,
+                    "nb_words": nb_words,
+                },
+                status_code=402,
+            )
+
+        # Résumés
+        summary = simple_summarizer(full_text)
+        ai_summary = smart_groq_summary(full_text)
+
+        # Store doc and return doc_id (for Q&A)
+        doc_id = uuid.uuid4().hex
+        DOC_STORE[doc_id] = {"text": full_text, "pages": nb_pages, "words": nb_words}
+
+        return {
+            "summary": summary,
+            "ai_summary": ai_summary,
+            "nb_pages": nb_pages,
+            "nb_words": nb_words,
+            "paywall": False,
+            "admin_bypass": admin_ok,
+            "premium": premium_ok,
+            "doc_id": doc_id,
+        }
+
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+    finally:
+        try:
+            if doc is not None:
+                doc.close()
+        except Exception:
+            pass
+        try:
+            if tmp_path and os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+
+# ---------- Q&A ----------
+@app.post("/api/ask")
+async def ask_pdf(request: Request, payload: dict):
+    """
+    Q&A premium/admin:
+    - headers: x-admin-token / x-premium-token
+    - body: {"question": str, "doc_id": str (optionnel), "context_hint": str (optionnel)}
+    """
+    admin_ok = is_admin(request)
+    premium_ok = is_premium(request)
+    if not (admin_ok or premium_ok):
+        return JSONResponse({"error": "Premium or admin required for Q&A."}, status_code=403)
+
+    question = (payload.get("question") or "").strip()
+    if not question:
+        return JSONResponse({"error": "Missing 'question'."}, status_code=400)
+
+    doc_id = (payload.get("doc_id") or "").strip()
+    context_hint = (payload.get("context_hint") or "").strip()
+
+    context = ""
+    if doc_id and doc_id in DOC_STORE:
+        context = DOC_STORE[doc_id]["text"]
+    elif context_hint:
+        context = context_hint
+
+    if not context:
+        return JSONResponse({"error": "No document context available."}, status_code=400)
+
+    answer = smart_groq_qa(context, question)
+    return {"answer": answer, "doc_id": doc_id or None}
