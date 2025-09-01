@@ -1,6 +1,6 @@
 fastapi
-uvicorn
+uvicorn 
 python-dotenv
-PyMuPDF
+PyMuPDF 
+openai 
 python-multipart
-groq
