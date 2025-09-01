@@ -23,11 +23,9 @@ ADMIN_BYPASS_TOKEN = os.getenv("ADMIN_BYPASS_TOKEN")
 PREMIUM_TOKENS = [t.strip() for t in os.getenv("PREMIUM_TOKENS", "").split(",") if t.strip()]
 
 # ------- In-memory stores (MVP) -------
-# doc_id -> {"text": str, "pages": int, "words": int, "chunks": [{"text": str, "norm": str}]}
-DOC_STORE = {}
-# caching (7 days TTL)
-SUMMARY_CACHE = {}  # key: doc_hash -> {"md": str, "ts": float}
-QA_CACHE = {}       # key: (doc_id, normalized_q) -> {"answer": str, "ts": float}
+DOC_STORE = {}       # doc_id -> {"text": str, "pages": int, "words": int, "chunks": [{"text": str, "norm": str}]}
+SUMMARY_CACHE = {}   # key: doc_hash -> {"md": str, "ts": float}
+QA_CACHE = {}        # key: (doc_id, normalized_q) -> {"answer": str, "ts": float}
 
 def _doc_hash(s: str) -> str:
     return hashlib.sha256((s or "")[:20000].encode("utf-8", "ignore")).hexdigest()
@@ -41,7 +39,7 @@ origins = [
     "http://localhost:5173",
     "http://127.0.0.1:5173",
     "https://smart-pdf-i-gen.vercel.app",
-    "https://smart-pdf-i-gen-1.onrender.com",  # utile pour tests directs
+    "https://smart-pdf-i-gen-1.onrender.com",
 ]
 app.add_middleware(
     CORSMiddleware,
@@ -140,7 +138,6 @@ def score_chunk(norm_chunk: str, norm_query: str) -> float:
         if exact:
             score += exact * 1.0
         else:
-            # fuzzy boost (ex: "euler" vs "eulet" OCR)
             if any(_fuzzy_hit(w, t) for t in c_tokens):
                 score += 0.7
     for w in q_tokens:
@@ -155,6 +152,58 @@ def select_passages(text: str, question: str, k: int = 6, max_chars: int = 10000
     ctx = "\n\n---\n\n".join(ch["text"] for ch in ranked)
     return ctx[:max_chars]
 
+# ---------- Local (no-LLM) fallbacks ----------
+def _is_rate_limit_error(e: Exception) -> bool:
+    s = str(e).lower()
+    return ("rate limit" in s) or ("429" in s) or ("rate_limit" in s)
+
+def local_summary_markdown(text: str, bullets: int = 6) -> str:
+    """Résumé extractif simple & stable (JSON→MD sans LLM)."""
+    # Split sentences
+    sents = re.split(r'(?<=[.!?。？])\s+', (text or "").strip())
+    # Score by word frequency (sans stopwords)
+    freq = {}
+    for sent in sents:
+        for w in re.findall(r"[a-zA-ZÀ-ÖØ-öø-ÿ]+", sent.lower()):
+            if w in STOPWORDS or len(w) < 3:
+                continue
+            freq[w] = freq.get(w, 0) + 1
+    def score(sent):
+        words = re.findall(r"[a-zA-ZÀ-ÖØ-öø-ÿ]+", sent.lower())
+        return sum(freq.get(w, 0) for w in words) / (1 + len(words))
+    ranked = sorted(sents, key=score, reverse=True)
+    execu = " ".join(ranked[:2]) if ranked else ""
+    points = "\n".join(f"- {s}" for s in ranked[2:2+bullets])
+    md = []
+    if execu:
+        md.append("**Executive summary (2–3 sentences)**\n\n" + execu)
+    if points:
+        md.append("**Key points / Results**\n\n" + points)
+    md.append("**Recommendations**\n\n- (Not available in offline mode)")
+    return "\n\n".join(md).strip()
+
+def local_qa_answer(context: str, question: str) -> str:
+    """Réponse locale: renvoie le meilleur extrait aligné + petite explication."""
+    # Cherche les phrases contenant les mots de la question
+    qn = _normalize(question)
+    qtokens = [w for w in qn.split() if w not in STOPWORDS and len(w) > 2]
+    sents = re.split(r'(?<=[.!?。？])\s+', context)
+    def s_score(s):
+        sn = _normalize(s)
+        sc = 0.0
+        for w in qtokens:
+            if w in sn:
+                sc += 1.0
+            else:
+                if any(_fuzzy_hit(w, t) for t in sn.split()):
+                    sc += 0.7
+        return sc
+    best = sorted(sents, key=s_score, reverse=True)[:3]
+    if best and sum(s_score(x) for x in best) > 0:
+        quote = " ".join(best).strip()
+        return f"From the provided passages, most relevant snippet is:\n\n> …{quote}…\n\nThis is a local answer (offline mode)."
+    return "I cannot confidently find the answer in the provided passages (offline mode)."
+
 # ---------- Groq chat with fallback ----------
 def _groq_chat(messages, max_tokens, temperature=0.2, model=None):
     import openai
@@ -166,7 +215,6 @@ def _groq_chat(messages, max_tokens, temperature=0.2, model=None):
     primary = model or os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
     fallback = os.getenv("GROQ_MODEL_FALLBACK", "").strip()
     tried = []
-
     last_err = None
     for m in [primary] + ([fallback] if fallback and fallback != primary else []):
         tried.append(m)
@@ -178,26 +226,20 @@ def _groq_chat(messages, max_tokens, temperature=0.2, model=None):
                 temperature=temperature,
             )
         except Exception as e:
-            s = str(e).lower()
             last_err = e
-            # auto-fallback on 429 / rate limit
-            if "rate limit" in s or "429" in s or "limit" in s:
+            if _is_rate_limit_error(e):
+                # on tente le modèle suivant
                 continue
-            # other errors → stop
             break
     raise RuntimeError(f"Groq call failed (tried {tried}): {last_err}")
 
 # ---------- LLM calls ----------
 def smart_groq_summary_structured(text: str):
-    """
-    Demande une sortie JSON stricte; fallback en markdown si parsing échoue.
-    Renvoie (markdown_stable, sections_dict|None)
-    """
-    api_key = os.environ.get("GROQ_API_KEY", "")
-    if not api_key:
+    """JSON strict -> MD ; si rate-limit -> résumé local."""
+    if not os.environ.get("GROQ_API_KEY", ""):
         return "[Groq Error] No API key defined", None
 
-    head = (text or "")[:4500]  # plus compact
+    head = (text or "")[:4500]
     sys = (
         "You are an expert summarizer. Respond ONLY with a valid JSON object and nothing else. "
         'Schema: {"executive_summary": "2-3 sentences", "key_points": ["..."], '
@@ -219,7 +261,6 @@ def smart_groq_summary_structured(text: str):
         if raw.startswith("json"):
             raw = raw[4:].strip()
         data = json.loads(raw)
-
         md = []
         if data.get("executive_summary"):
             md.append("**Executive summary (2–3 sentences)**\n\n" + data["executive_summary"].strip())
@@ -230,15 +271,18 @@ def smart_groq_summary_structured(text: str):
         if data.get("remarks"):
             md.append("**Other important remarks**\n\n" + data["remarks"].strip())
         return "\n\n".join(md).strip(), data
-    except Exception:
-        # Fallback: markdown libre
+    except Exception as e:
+        # Si rate-limit (ou fallback aussi rate-limit) -> résumé local
+        if _is_rate_limit_error(e):
+            return local_summary_markdown(text), None
+        # Sinon, tente le fallback markdown
         return smart_groq_summary_fallback(text), None
 
 def smart_groq_summary_fallback(text: str) -> str:
-    api_key = os.environ.get("GROQ_API_KEY", "")
-    if not api_key:
+    """Fallback markdown ; si rate-limit -> résumé local."""
+    if not os.environ.get("GROQ_API_KEY", ""):
         return "[Groq Error] No API key defined"
-    head = (text or "")[:3800]  # compact
+    head = (text or "")[:3800]
     prompt = (
         "Summarize this PDF document in the original language, professionally, as if explaining to an executive. "
         "Extract only the key information, main results, recommendations, and important insights for decision-making. "
@@ -257,13 +301,14 @@ def smart_groq_summary_fallback(text: str) -> str:
         )
         return (resp.choices[0].message.content or "").strip()
     except Exception as e:
+        if _is_rate_limit_error(e):
+            return local_summary_markdown(text)
         return f"[Groq Error] {e}"
 
 def smart_groq_qa(context: str, question: str) -> str:
-    api_key = os.environ.get("GROQ_API_KEY", "")
-    if not api_key:
+    """Q&A ; si rate-limit -> réponse locale basée passages."""
+    if not os.environ.get("GROQ_API_KEY", ""):
         return "[Groq Error] No API key defined"
-
     user = (
         "Using ONLY the provided PDF excerpts, answer the question accurately. "
         "Quote very short snippets with “…” and mention any visible page/section cues if present. "
@@ -282,6 +327,8 @@ def smart_groq_qa(context: str, question: str) -> str:
         )
         return (resp.choices[0].message.content or "").strip()
     except Exception as e:
+        if _is_rate_limit_error(e):
+            return local_qa_answer(context, question)
         return f"[Groq Error] {e}"
 
 # ---------- Health ----------
@@ -306,7 +353,7 @@ def premium_check(request: Request):
 @app.post("/api/summarize")
 async def summarize_pdf(request: Request, file: UploadFile = File(...)):
     """
-    Upload PDF -> extract -> tidy -> JSON-structured summary (fallback markdown).
+    Upload PDF -> extract -> tidy -> JSON-structured summary (fallback markdown or local).
     Stocke texte + chunks pour Q&A. Résumé mis en cache 7 jours par document.
     """
     tmp_path = None
@@ -316,12 +363,11 @@ async def summarize_pdf(request: Request, file: UploadFile = File(...)):
             tmp.write(content)
             tmp_path = tmp.name
 
-        # Compter pages
+        # Pages
         doc = fitz.open(tmp_path)
         nb_pages = doc.page_count
         doc.close()
 
-        # Texte nettoyé
         raw_text = extract_pdf_text_sorted(tmp_path)
         full_text = tidy_text(raw_text)
         nb_words = len(full_text.split())
@@ -332,7 +378,7 @@ async def summarize_pdf(request: Request, file: UploadFile = File(...)):
         admin_ok = is_admin(request)
         premium_ok = is_premium(request)
 
-        # Paywall si ni admin ni premium
+        # Paywall
         if (nb_pages > FREE_PAGE_LIMIT or nb_words > FREE_WORD_LIMIT) and not (admin_ok or premium_ok):
             return JSONResponse(
                 {
@@ -344,7 +390,7 @@ async def summarize_pdf(request: Request, file: UploadFile = File(...)):
                 status_code=402,
             )
 
-        # Caching du résumé (par contenu)
+        # Cache par contenu
         dh = _doc_hash(full_text)
         cached = SUMMARY_CACHE.get(dh)
         if cached and (time() - cached["ts"] < 7 * 24 * 3600):
@@ -353,10 +399,10 @@ async def summarize_pdf(request: Request, file: UploadFile = File(...)):
             ai_md, ai_sections = smart_groq_summary_structured(full_text)
             SUMMARY_CACHE[dh] = {"md": ai_md, "ts": time()}
 
-        # Petit résumé heuristique
+        # Heuristique courte
         simple = simple_summarizer(full_text)
 
-        # Stockage + chunks pour Q&A
+        # Store + chunks
         doc_id = uuid.uuid4().hex
         DOC_STORE[doc_id] = {
             "text": full_text,
@@ -367,8 +413,8 @@ async def summarize_pdf(request: Request, file: UploadFile = File(...)):
 
         return {
             "summary": simple,
-            "ai_summary": ai_md,          # markdown stable
-            "ai_sections": ai_sections,   # (optionnel) JSON structuré
+            "ai_summary": ai_md,
+            "ai_sections": ai_sections,
             "nb_pages": nb_pages,
             "nb_words": nb_words,
             "paywall": False,
@@ -408,7 +454,7 @@ async def ask_pdf(request: Request, payload: dict):
     doc_id = (payload.get("doc_id") or "").strip()
     context_hint = (payload.get("context_hint") or "").strip()
 
-    # Cache par (doc, question)
+    # Cache
     cache_key = None
     if doc_id and doc_id in DOC_STORE:
         cache_key = (doc_id, _norm_q(question))
@@ -428,7 +474,6 @@ async def ask_pdf(request: Request, payload: dict):
 
     answer = smart_groq_qa(context, question)
 
-    # Mise en cache si succès
     if cache_key and isinstance(answer, str) and not answer.startswith("[Groq Error]"):
         QA_CACHE[cache_key] = {"answer": answer, "ts": time()}
 
