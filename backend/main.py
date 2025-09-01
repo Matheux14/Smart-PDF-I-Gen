@@ -1,33 +1,32 @@
 from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-import fitz  # PyMuPDF
 import tempfile
 import os
+import fitz  # PyMuPDF
 
 from dotenv import load_dotenv
 load_dotenv()
 
 # --- Limites gratuites ---
 FREE_PAGE_LIMIT = 30
-FREE_WORD_LIMIT = 50000
+FREE_WORD_LIMIT = 50_000
 
-app = FastAPI()
+app = FastAPI(title="Smart PDF I-Gen Backend")
 
-# CORS config
+# --- CORS : origines autorisées (dev + front en prod) ---
+# NB: on autorise le front Vercel et le dev local. Le domaine backend n'est pas requis pour CORS.
 origins = [
-    "http://localhost:5173",              # Pour le dev local
-    "https://smart-pdf-i-gen.vercel.app", # Ton déploiement Vercel (ou adapte)
-    "https://summarizeai.com",
-    "https://www.summarizeai.com",
-    "https://smart-pdf-i-gen-1.onrender.com"
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "https://smart-pdf-i-gen.vercel.app",
+    # (facultatif) si tu as un autre front, ajoute-le ici
 ]
-
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
-    allow_credentials=True,
+    allow_credentials=True,   # mets False si tu n'utilises pas de cookies/credentials
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -35,45 +34,51 @@ app.add_middleware(
 @app.get("/ping")
 def ping():
     """Health check route"""
-    return {"pong": True}
+    return {"pong": True, "model": os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")}
 
 @app.post("/api/summarize")
 async def summarize_pdf(file: UploadFile = File(...)):
-    # 1. Save PDF temporarily
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-        content = await file.read()
-        tmp.write(content)
-        tmp_path = tmp.name
+    """
+    Réception d'un PDF, extraction du texte, puis double résumé :
+      - simple_summarizer : heuristique rapide (3 phrases)
+      - smart_groq_summary : appel Groq (LLM)
+    """
+    tmp_path = None
+    doc = None
 
     try:
-        # Extract text
-        doc = fitz.open(tmp_path)
-        full_text = ""
-        for page in doc:
-            full_text += page.get_text()
-        nb_pages = doc.page_count
-        nb_words = len(full_text.split())
-        doc.close()
+        # 1) Sauvegarde temporaire du PDF
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+            content = await file.read()
+            tmp.write(content)
+            tmp_path = tmp.name
 
-        # Always remove the temp file (good cloud hygiene)
-        os.remove(tmp_path)
+        # 2) Extraction du texte
+        doc = fitz.open(tmp_path)
+        full_text_parts = []
+        for page in doc:
+            full_text_parts.append(page.get_text())
+        nb_pages = doc.page_count
+        full_text = " ".join(full_text_parts)
+        nb_words = len(full_text.split())
 
         if not full_text.strip():
             return JSONResponse({"error": "The PDF is empty or unreadable."}, status_code=400)
 
-        # Paywall: block if too large
+        # 3) Paywall : limites gratuites
         if nb_pages > FREE_PAGE_LIMIT or nb_words > FREE_WORD_LIMIT:
-            return JSONResponse({
-                "error": "This document exceeds the free limit (30 pages or 50,000 words). Please subscribe to continue.",
-                "paywall": True,
-                "nb_pages": nb_pages,
-                "nb_words": nb_words
-            }, status_code=402)  # 402 = Payment Required
+            return JSONResponse(
+                {
+                    "error": "This document exceeds the free limit (30 pages or 50,000 words). Please subscribe to continue.",
+                    "paywall": True,
+                    "nb_pages": nb_pages,
+                    "nb_words": nb_words,
+                },
+                status_code=402,  # 402 Payment Required
+            )
 
-        # Simple summary
+        # 4) Résumés
         summary = simple_summarizer(full_text)
-
-        # AI summary
         ai_summary = smart_groq_summary(full_text)
 
         return {
@@ -81,29 +86,55 @@ async def summarize_pdf(file: UploadFile = File(...)):
             "ai_summary": ai_summary,
             "nb_pages": nb_pages,
             "nb_words": nb_words,
-            "paywall": False
+            "paywall": False,
         }
+
     except Exception as e:
-        # Try to remove the temp file in case of crash (double check)
-        try:
-            os.remove(tmp_path)
-        except Exception:
-            pass
         return JSONResponse({"error": str(e)}, status_code=500)
 
-def simple_summarizer(text, max_sentences=3):
-    import re
-    # Split into sentences (multi-language)
-    sentences = re.split(r'(?<=[.!?。؟]) +', text)
-    summary = ' '.join(sentences[:max_sentences])
-    return summary
+    finally:
+        # Nettoyage (sécurité)
+        try:
+            if doc is not None:
+                doc.close()
+        except Exception:
+            pass
+        try:
+            if tmp_path and os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
 
-def smart_groq_summary(text):
+
+# ------------------ Helpers ------------------
+
+def simple_summarizer(text: str, max_sentences: int = 3) -> str:
+    """
+    Petit résumé heuristique : prend les premières phrases du texte.
+    """
+    import re
+    # Split en phrases multilingues (., !, ?, ponctuations asiatiques)
+    sentences = re.split(r'(?<=[.!?。？])\s+', text.strip())
+    return " ".join(sentences[:max_sentences])
+
+
+def smart_groq_summary(text: str) -> str:
+    """
+    Appel à l'API Groq (endpoint OpenAI-compatible) pour un résumé structuré.
+    - Utilise GROQ_API_KEY (obligatoire)
+    - Utilise GROQ_MODEL (optionnel, défaut: llama-3.3-70b-versatile)
+    - IMPORTANT (SDK OpenAI) : utiliser max_tokens, pas max_completion_tokens.
+    """
     import openai
 
     api_key = os.environ.get("GROQ_API_KEY", "")
     if not api_key:
         return "[Groq Error] No API key defined"
+
+    model = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+
+    # On tronque pour éviter d'envoyer des documents gigantesques en entrée
+    head = text[:6000]
 
     prompt = (
         "Summarize this PDF document in the original language, professionally, as if explaining to an executive. "
@@ -114,23 +145,27 @@ def smart_groq_summary(text):
         "2. Key points / Results (list)\n"
         "3. Recommendations (list)\n"
         "4. Other important remarks (optional)\n\n"
-        f"PDF content:\n{text[:6000]}"
+        f"PDF content:\n{head}"
     )
 
     try:
         client = openai.OpenAI(
             api_key=api_key,
-            base_url="https://api.groq.com/openai/v1"
+            base_url="https://api.groq.com/openai/v1",  # OpenAI-compatible
         )
-        response = client.chat.completions.create(
-            model="llama3-70b-8192",
+        resp = client.chat.completions.create(
+            model=model,
             messages=[
-                {"role": "system", "content": "You are an expert at summarizing professional and academic documents in all languages."},
-                {"role": "user", "content": prompt}
+                {
+                    "role": "system",
+                    "content": "You are an expert at summarizing professional and academic documents in all languages.",
+                },
+                {"role": "user", "content": prompt},
             ],
-            max_tokens=600,
+            max_tokens=600,   # <- SDK OpenAI attend max_tokens
             temperature=0.2,
         )
-        return response.choices[0].message.content.strip()
+        return (resp.choices[0].message.content or "").strip()
+
     except Exception as e:
         return f"[Groq Error] {e}"
