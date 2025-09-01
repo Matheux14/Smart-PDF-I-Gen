@@ -54,6 +54,15 @@ function parseSections(raw: string) {
   return sections;
 }
 
+// Nettoyage du markdown (supprime ":" parasites, contrôles, etc.)
+function tidyMarkdown(md: string) {
+  return (md || "")
+    .replace(/^\s*:\s+/gm, "")      // ":" en début de ligne
+    .replace(/\u200b/g, "")         // zero-width
+    .replace(/\n{3,}/g, "\n\n")     // lignes vides multiples
+    .trim();
+}
+
 /* =========================
    Constants (client)
 ========================= */
@@ -164,7 +173,6 @@ const App: React.FC = () => {
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
-    // Valider tokens au chargement
     validateAdmin().then(setAdminOn);
     validatePremium().then(setPremiumOn);
   }, []);
@@ -234,14 +242,13 @@ const App: React.FC = () => {
       const t1 = performance.now();
 
       setProcessingTime(((t1 - t0) / 1000).toFixed(1) + "s");
-      setSummaryRaw(res.data.summary || "");
-      setAiSummary(res.data.ai_summary || "");
+      setSummaryRaw(tidyMarkdown(res.data.summary || ""));
+      setAiSummary(tidyMarkdown(res.data.ai_summary || ""));
       setWordCount(res.data.nb_words || 0);
       setNbPages(res.data.nb_pages ?? null);
       setPaywall(!!res.data.paywall);
       if (res.data.doc_id) setDocId(res.data.doc_id);
 
-      // Si le serveur confirme, synchroniser l'état
       if (res.data.admin_bypass === true) setAdminOn(true);
       if (res.data.premium === true) setPremiumOn(true);
     } catch (err: any) {
@@ -278,7 +285,7 @@ const App: React.FC = () => {
 
       const body: any = { question: question.trim() };
       if (docId) body.doc_id = docId;
-      else body.context_hint = (aiSummary || summaryRaw || "").slice(0, 6000); // fallback
+      else body.context_hint = (aiSummary || summaryRaw || "").slice(0, 6000);
 
       const r = await axios.post(`${API_URL}/api/ask`, body, { headers });
       setAnswer(r.data?.answer || "");
@@ -462,7 +469,7 @@ const App: React.FC = () => {
           </div>
 
           {/* Switches */}
-          <div className="flex gap-2">
+          <div className="flex gap-2 flex-wrap justify-end">
             <PremiumPill />
             <AdminPill />
           </div>
@@ -695,13 +702,13 @@ const App: React.FC = () => {
             <span className="text-lg font-semibold text-white">Smart PDF AI</span>
             <span className="mx-2 text-slate-400">|</span>
             <span className="text-slate-400">
-              © {new Date().getFullYear()} summarizeai.com
+              © {new Date().getFullYear()} smart-pdf-i-gen.vercel.app
             </span>
           </div>
           <div className="text-center md:text-right text-slate-400 text-sm">
             For support:{" "}
-            <a href="mailto:support@summarizeai.com" className="underline hover:text-white">
-              support@summarizeai.com
+            <a href="mailto:smartpdfigen@gmail.com" className="underline hover:text-white">
+              smartpdfigen@gmail.com
             </a>
           </div>
         </div>

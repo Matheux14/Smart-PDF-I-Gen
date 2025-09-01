@@ -47,9 +47,37 @@ def is_premium(request: Request) -> bool:
     tok = request.headers.get("x-premium-token", "")
     return bool(tok and tok in PREMIUM_TOKENS)
 
+def extract_pdf_text_sorted(pdf_path: str) -> str:
+    """Extraction robuste: blocs triés (y,x) + fallback + normalisation."""
+    import unicodedata
+    doc = fitz.open(pdf_path)
+    pages = []
+    for page in doc:
+        blocks = page.get_text("blocks") or []
+        # block = (x0, y0, x1, y1, text, block_no, ...)
+        blocks.sort(key=lambda b: (round(b[1], 1), round(b[0], 1)))
+        txt = "\n".join(b[4] for b in blocks if isinstance(b[4], str) and b[4].strip())
+        if len((txt or "").strip()) < 40:  # fallback si page quasi vide
+            txt = page.get_text("text")
+        txt = unicodedata.normalize("NFKC", (txt or "")).replace("\x00", "")
+        pages.append(txt)
+    doc.close()
+    return "\n\n".join(pages)
+
+def tidy_text(s: str) -> str:
+    """Nettoie artefacts: espaces, traits répétés, répétitions aberrantes, lignes vides."""
+    import re, unicodedata
+    s = unicodedata.normalize("NFKC", s or "")
+    s = s.replace("\u200b", "").replace("\x00", "")
+    s = re.sub(r"[^\S\r\n]+", " ", s)               # espaces multiples -> 1
+    s = re.sub(r"[-_]{4,}", "—", s)                 # longues suites de -/_
+    s = re.sub(r"\b(\w{2,})(?:\W+\1){7,}\b", r"\1", s, flags=re.IGNORECASE)  # répétitions
+    s = re.sub(r"\n{3,}", "\n\n", s)                # lignes vides multiples
+    return s.strip()
+
 def simple_summarizer(text: str, max_sentences: int = 3) -> str:
     import re
-    sentences = re.split(r'(?<=[.!?。？])\s+', text.strip())
+    sentences = re.split(r'(?<=[.!?。？])\s+', (text or "").strip())
     return " ".join(sentences[:max_sentences])
 
 def smart_groq_summary(text: str) -> str:
@@ -60,7 +88,7 @@ def smart_groq_summary(text: str) -> str:
         return "[Groq Error] No API key defined"
 
     model = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
-    head = text[:6000]
+    head = (text or "")[:6000]
 
     prompt = (
         "Summarize this PDF document in the original language, professionally, as if explaining to an executive. "
@@ -97,8 +125,7 @@ def smart_groq_qa(context: str, question: str) -> str:
         return "[Groq Error] No API key defined"
     model = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 
-    # Contexte tronqué pour rester safe
-    ctx = context[:7000]
+    ctx = (context or "")[:7000]
     user = (
         "Answer the question strictly using the provided PDF context. "
         "Cite section names if they appear. Be concise and structured.\n\n"
@@ -150,10 +177,15 @@ async def summarize_pdf(request: Request, file: UploadFile = File(...)):
             tmp.write(content)
             tmp_path = tmp.name
 
+        # Ouvrir juste pour compter les pages
         doc = fitz.open(tmp_path)
-        full_text_parts = [page.get_text() for page in doc]
         nb_pages = doc.page_count
-        full_text = " ".join(full_text_parts)
+        doc.close()
+        doc = None
+
+        # Extraction robuste + nettoyage
+        full_text = extract_pdf_text_sorted(tmp_path)
+        full_text = tidy_text(full_text)
         nb_words = len(full_text.split())
 
         if not full_text.strip():
