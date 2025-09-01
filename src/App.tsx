@@ -1,9 +1,9 @@
-import React, { useState, useRef } from "react";
+import React, { useState, useRef, useEffect } from "react";
 import axios from "axios";
 import ReactMarkdown from "react-markdown";
 import remarkMath from "remark-math";
 import rehypeKatex from "rehype-katex";
-import 'katex/dist/katex.min.css';
+import "katex/dist/katex.min.css";
 import {
   Upload,
   FileText,
@@ -14,52 +14,57 @@ import {
   ChevronLeft,
   ChevronRight,
   Zap,
-  Eye
+  Eye,
+  ShieldCheck,
 } from "lucide-react";
 
-// Example PDFs for demo carousel
+/* =========================
+   Demo carousel
+========================= */
 const examplePdfs = [
   { name: "Research Paper", pages: 12, type: "Academic" },
   { name: "Business Report", pages: 8, type: "Corporate" },
   { name: "Technical Manual", pages: 25, type: "Technical" },
-  { name: "Legal Document", pages: 15, type: "Legal" }
+  { name: "Legal Document", pages: 15, type: "Legal" },
 ];
 
-// --- UTILS ---
+/* =========================
+   Utils
+========================= */
 function parseSections(raw: string) {
   const regex = /\*\*(.+?)\*\*/g;
   let match;
   let lastIndex = 0;
-  let sections: { title: string; content: string }[] = [];
-  let currentTitle = "";
+  const sections: { title: string; content: string }[] = [];
   while ((match = regex.exec(raw)) !== null) {
     if (sections.length > 0) {
       sections[sections.length - 1].content = raw.slice(lastIndex, match.index).trim();
     }
-    currentTitle = match[1];
-    sections.push({ title: currentTitle, content: "" });
+    sections.push({ title: match[1], content: "" });
     lastIndex = regex.lastIndex;
   }
   if (sections.length > 0) {
     sections[sections.length - 1].content = raw.slice(lastIndex).trim();
   }
-  if (sections.length > 0 && raw.indexOf("**") > 0) {
-    const header = raw.slice(0, raw.indexOf("**")).trim();
-    if (header) sections.unshift({ title: "Header", content: header });
-  }
-  if (sections.length === 0) {
-    return [{ title: "", content: raw }];
-  }
+  if (sections.length === 0) return [{ title: "", content: raw }];
   return sections;
 }
 
+/* =========================
+   Constants (client)
+========================= */
 const PAYWALL_PAGES = 30;
 const PAYWALL_WORDS = 50000;
 const KO_FI_LINK = "https://ko-fi.com/konanothniel155";
 
-// Utilise l'URL d'API selon l'environnement
-const API_URL = import.meta.env.VITE_API_URL || "http://localhost:8000";
+// IMPORTANT : on utilise la même clé d'env que côté déploiement
+const API_URL =
+  import.meta.env.VITE_API_BASE_URL ||
+  "https://smart-pdf-i-gen-1.onrender.com"; // fallback sûr
 
+/* =========================
+   Component
+========================= */
 const App: React.FC = () => {
   const [isDragOver, setIsDragOver] = useState(false);
   const [uploadedFile, setUploadedFile] = useState<File | null>(null);
@@ -75,9 +80,17 @@ const App: React.FC = () => {
   const [copied, setCopied] = useState(false);
   const [paywall, setPaywall] = useState(false);
 
+  // Admin
+  const [adminOn, setAdminOn] = useState<boolean>(false);
+
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // --- Drag & Drop events ---
+  useEffect(() => {
+    // Activer le mode admin si un token est présent dans le navigateur
+    setAdminOn(!!localStorage.getItem("ADMIN_BYPASS_TOKEN"));
+  }, []);
+
+  /* ---------- Drag & Drop ---------- */
   const handleDragOver = (e: React.DragEvent) => {
     e.preventDefault();
     setIsDragOver(true);
@@ -96,7 +109,7 @@ const App: React.FC = () => {
     }
   };
 
-  // --- File select ---
+  /* ---------- File select ---------- */
   const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files;
     if (files && files.length > 0) {
@@ -104,9 +117,7 @@ const App: React.FC = () => {
       resetAll();
     }
   };
-  const handleUploadClick = () => {
-    fileInputRef.current?.click();
-  };
+  const handleUploadClick = () => fileInputRef.current?.click();
 
   function resetAll() {
     setSummaryRaw("");
@@ -118,41 +129,43 @@ const App: React.FC = () => {
     setProcessingTime("");
   }
 
-  // --- Upload & Summarize ---
+  /* ---------- Upload & Summarize ---------- */
   const handleSummarize = async () => {
     if (!uploadedFile) return;
     setIsProcessing(true);
-    resetAll();
+    setError("");
+    setPaywall(false);
 
     try {
       const t0 = performance.now();
       const formData = new FormData();
       formData.append("file", uploadedFile);
 
-      const res = await axios.post(
-        `${API_URL}/api/summarize`,
-        formData,
-        { headers: { "Content-Type": "multipart/form-data" } }
-      );
+      // Header admin si présent
+      const headers: Record<string, string> = { "Content-Type": "multipart/form-data" };
+      const token = localStorage.getItem("ADMIN_BYPASS_TOKEN");
+      if (token) headers["x-admin-token"] = token;
+
+      const res = await axios.post(`${API_URL}/api/summarize`, formData, { headers });
       const t1 = performance.now();
 
       setProcessingTime(((t1 - t0) / 1000).toFixed(1) + "s");
       setSummaryRaw(res.data.summary || "");
       setAiSummary(res.data.ai_summary || "");
       setWordCount(res.data.nb_words || 0);
-      setNbPages(res.data.nb_pages || null);
-      setPaywall(res.data.paywall || false);
+      setNbPages(res.data.nb_pages ?? null);
+      setPaywall(!!res.data.paywall);
     } catch (err: any) {
       const paywallResponse = err?.response?.data?.paywall;
       if (paywallResponse) {
         setPaywall(true);
-        setNbPages(err?.response?.data?.nb_pages || null);
-        setWordCount(err?.response?.data?.nb_words || 0);
+        setNbPages(err?.response?.data?.nb_pages ?? null);
+        setWordCount(err?.response?.data?.nb_words ?? 0);
         setError("");
       } else {
         setError(
           err?.response?.data?.error ||
-          "PDF analysis failed. Please try again or use a smaller file."
+            "PDF analysis failed. Please try again or use a smaller file."
         );
       }
     } finally {
@@ -160,40 +173,87 @@ const App: React.FC = () => {
     }
   };
 
-  // --- Copy summary as plain text ---
+  /* ---------- Copy ---------- */
   const copyToClipboard = () => {
-    navigator.clipboard.writeText((aiSummary || summaryRaw).trim());
+    const text = (aiSummary || summaryRaw || "").trim();
+    if (!text) return;
+    navigator.clipboard.writeText(text);
     setCopied(true);
-    setTimeout(() => setCopied(false), 1500);
+    setTimeout(() => setCopied(false), 1200);
   };
 
-  // --- Carousel example ---
-  const nextExample = () =>
-    setCurrentExample(prev => (prev + 1) % examplePdfs.length);
+  /* ---------- Carousel ---------- */
+  const nextExample = () => setCurrentExample((p) => (p + 1) % examplePdfs.length);
   const prevExample = () =>
-    setCurrentExample(prev => (prev - 1 + examplePdfs.length) % examplePdfs.length);
+    setCurrentExample((p) => (p - 1 + examplePdfs.length) % examplePdfs.length);
 
-  // --- Paywall UI (ENGLISH) ---
+  /* ---------- Responsive Ko-fi banner ---------- */
+  const PremiumBanner = () => (
+    <div className="px-4 sm:px-6 lg:px-8 -mt-2 mb-8">
+      <section
+        className="
+          w-full max-w-4xl mx-auto
+          rounded-2xl border border-white/10
+          bg-gradient-to-br from-fuchsia-500/10 via-indigo-500/10 to-cyan-400/10
+          p-4 sm:p-5 lg:p-6 shadow-[0_6px_24px_rgba(0,0,0,.25)]
+          flex flex-wrap items-center gap-3 sm:gap-4
+        "
+        role="complementary"
+        aria-label="Premium upsell"
+      >
+        <div className="flex items-start gap-3 flex-1 min-w-[220px]">
+          <span className="text-xl sm:text-2xl" aria-hidden>
+            🚀
+          </span>
+          <div>
+            <h3 className="m-0 font-bold text-base sm:text-lg text-white">
+              Want unlimited large PDF summaries & AI-powered Q&A?
+            </h3>
+            <p className="m-0 mt-1 text-xs sm:text-sm text-slate-300">
+              Supporting us unlocks premium features and helps this project grow.
+            </p>
+          </div>
+        </div>
+
+        <a
+          href={KO_FI_LINK}
+          target="_blank"
+          rel="noreferrer"
+          className="
+            inline-flex items-center justify-center
+            px-4 sm:px-5 py-2 rounded-xl font-bold
+            bg-pink-400 text-slate-900
+            hover:bg-pink-300 transition
+            shadow-[0_10px_24px_rgba(255,80,170,.25)]
+          "
+          aria-label="Upgrade via Ko-fi"
+        >
+          💖 Upgrade via Ko-fi
+        </a>
+      </section>
+    </div>
+  );
+
+  /* ---------- Paywall block ---------- */
   const PaywallNotice = () => (
     <div className="bg-yellow-200 text-yellow-900 rounded-xl p-5 my-4 text-center shadow-lg border border-yellow-300">
-      <h3 className="text-2xl font-bold mb-2">
-        Large document detected
-      </h3>
+      <h3 className="text-2xl font-bold mb-2">Large document detected</h3>
       <p className="mb-2">
         This document has <b>{nbPages}</b> pages ({wordCount} words).<br />
         The free limit is <b>{PAYWALL_PAGES} pages</b> or <b>{PAYWALL_WORDS} words</b>.
       </p>
       <p className="mb-4 font-semibold">
         <span className="text-red-700">
-          Please support the project or unlock large document processing via Ko-fi (supports PayPal, Mobile Money, cards)!
+          Please support the project or unlock large document processing via Ko-fi (PayPal, Mobile
+          Money, cards).
         </span>
       </p>
-      <div className="flex flex-col md:flex-row items-center justify-center gap-4">
+      <div className="flex flex-col sm:flex-row items-center justify-center gap-3">
         <a
           href={KO_FI_LINK}
           target="_blank"
           rel="noopener noreferrer"
-          className="inline-block bg-pink-500 hover:bg-pink-700 text-white px-6 py-3 rounded-xl font-bold shadow transition"
+          className="inline-block bg-pink-500 hover:bg-pink-600 text-white px-6 py-3 rounded-xl font-bold shadow transition"
         >
           💖 Support / Unlock with Ko-fi
         </a>
@@ -204,65 +264,72 @@ const App: React.FC = () => {
     </div>
   );
 
-  // --- PREMIUM BANNER ---
-  const PremiumBanner = () => (
-    <div className="flex justify-center mt-2 mb-8">
-      <div className="bg-gradient-to-r from-yellow-300 via-pink-200 to-blue-200 text-[#222a3b] rounded-2xl px-6 py-4 shadow-lg border border-yellow-400 max-w-2xl w-full text-center">
-        <div className="flex flex-col md:flex-row items-center justify-center gap-3">
-          <span className="text-xl font-semibold">
-            🚀 Want unlimited large PDF summaries & AI-powered Q&#38;A?
-          </span>
-          <a
-            href={KO_FI_LINK}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="inline-block bg-pink-500 hover:bg-pink-700 text-white px-5 py-2 rounded-xl font-bold shadow transition mt-2 md:mt-0"
-          >
-            💖 Upgrade Now via Ko-fi
-          </a>
-        </div>
-        <div className="text-sm text-[#555] mt-2">
-          Supporting us unlocks unlimited access to premium features and helps this project grow.
-        </div>
-      </div>
-    </div>
+  /* ---------- Admin pill ---------- */
+  const AdminPill = () => (
+    <button
+      onClick={() => {
+        if (adminOn) {
+          localStorage.removeItem("ADMIN_BYPASS_TOKEN");
+          setAdminOn(false);
+        } else {
+          const t = prompt("Enter admin token (matches ADMIN_BYPASS_TOKEN on Render)");
+          if (t && t.trim()) {
+            localStorage.setItem("ADMIN_BYPASS_TOKEN", t.trim());
+            setAdminOn(true);
+          }
+        }
+      }}
+      className={`inline-flex items-center gap-2 px-3 py-1.5 rounded-full border text-sm font-semibold
+        ${adminOn ? "border-emerald-400/40 text-emerald-300 bg-emerald-600/10" : "border-white/15 text-slate-300 bg-white/5"}
+      `}
+      title="Toggle admin bypass"
+    >
+      <ShieldCheck className="w-4 h-4" />
+      Admin: {adminOn ? "ON" : "OFF"}
+    </button>
   );
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-[#232E45] to-[#1C2030] text-white flex flex-col">
       {/* Header */}
-      <header className="pt-12 pb-8 text-center">
-        <div className="flex items-center justify-center mb-4">
-          <div className="p-3 bg-gradient-to-r from-indigo-600 to-blue-600 rounded-xl mr-4">
-            <Zap className="w-8 h-8 text-white" />
+      <header className="pt-10 pb-6">
+        <div className="max-w-7xl px-6 mx-auto flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <div className="p-3 bg-gradient-to-r from-indigo-600 to-blue-600 rounded-xl">
+              <Zap className="w-7 h-7 text-white" />
+            </div>
+            <div>
+              <h1 className="text-3xl sm:text-4xl font-bold bg-gradient-to-r from-indigo-400 to-blue-400 text-transparent bg-clip-text">
+                Smart-PDF-I-Gen
+              </h1>
+              <p className="text-sm sm:text-base text-slate-300">
+                Transform any PDF into concise, intelligent summaries using advanced AI.
+              </p>
+            </div>
           </div>
-          <h1 className="text-5xl font-bold bg-gradient-to-r from-indigo-400 to-blue-400 text-transparent bg-clip-text">
-            Smart-PDF-I-Gen
-          </h1>
+
+          {/* Admin switch (discret) */}
+          <AdminPill />
         </div>
-        <p className="text-xl text-slate-300 max-w-2xl mx-auto leading-relaxed">
-          Transform any PDF document into concise, intelligent summaries using advanced AI technology.
-        </p>
       </header>
 
       {/* Premium Banner */}
       <PremiumBanner />
 
-      {/* Main Content */}
+      {/* Main */}
       <main className="flex-1 max-w-7xl mx-auto px-6 pb-16 w-full">
         <div className="grid lg:grid-cols-2 gap-8">
-          {/* Left: Upload & Carousel */}
-          <div className="bg-[#232840] rounded-2xl shadow-lg p-8 flex flex-col">
+          {/* Left: Upload */}
+          <div className="bg-[#232840] rounded-2xl shadow-lg p-6 sm:p-8 flex flex-col">
             <div className="flex items-center mb-6">
               <Upload className="w-6 h-6 text-indigo-400 mr-3" />
               <h2 className="text-2xl font-semibold text-white">Upload Your PDF</h2>
             </div>
-            {/* Upload zone */}
+
+            {/* Dropzone */}
             <div
               className={`p-8 text-center mb-6 border-2 border-dashed rounded-xl transition-colors ${
-                isDragOver
-                  ? "border-indigo-400 bg-[#1E2436]"
-                  : "border-[#33498c] bg-[#232840]"
+                isDragOver ? "border-indigo-400 bg-[#1E2436]" : "border-[#33498c] bg-[#232840]"
               }`}
               onDragOver={handleDragOver}
               onDragLeave={handleDragLeave}
@@ -278,32 +345,31 @@ const App: React.FC = () => {
                 className="hidden"
               />
               {uploadedFile ? (
-                <div className="space-y-4">
+                <div className="space-y-3">
                   <FileCheck className="w-16 h-16 text-green-400 mx-auto" />
                   <div>
-                    <p className="text-lg font-medium text-white">{uploadedFile.name}</p>
+                    <p className="text-lg font-medium text-white break-all">{uploadedFile.name}</p>
                     <p className="text-slate-400">
                       {(uploadedFile.size / 1024 / 1024).toFixed(2)} MB
                     </p>
                   </div>
                 </div>
               ) : (
-                <div className="space-y-4">
+                <div className="space-y-3">
                   <FileText className="w-16 h-16 text-slate-400 mx-auto" />
                   <div>
-                    <p className="text-lg font-medium text-white mb-2">
-                      Drag & drop your PDF here
-                    </p>
+                    <p className="text-lg font-medium text-white mb-1">Drag & drop your PDF here</p>
                     <p className="text-slate-400">or click to browse files</p>
                   </div>
                 </div>
               )}
             </div>
-            {/* Action button */}
+
+            {/* Action */}
             <button
               onClick={handleSummarize}
               disabled={!uploadedFile || isProcessing}
-              className={`w-full py-3 rounded-xl font-bold shadow transition text-lg mt-2
+              className={`w-full py-3 rounded-xl font-bold shadow transition text-lg mt-1
                 ${
                   !uploadedFile || isProcessing
                     ? "bg-indigo-900/60 text-[#b7cbfa] cursor-not-allowed"
@@ -322,7 +388,8 @@ const App: React.FC = () => {
                 </div>
               )}
             </button>
-            {/* Example PDFs Carousel */}
+
+            {/* Examples */}
             <div className="mt-8">
               <h3 className="text-lg font-medium text-white mb-4">Example Documents</h3>
               <div className="bg-[#20253C] rounded-xl p-4">
@@ -330,21 +397,20 @@ const App: React.FC = () => {
                   <button
                     onClick={prevExample}
                     className="p-2 hover:bg-slate-600/50 rounded-lg transition-colors"
+                    aria-label="Previous example"
                   >
                     <ChevronLeft className="w-5 h-5 text-slate-300" />
                   </button>
                   <div className="text-center flex-1">
-                    <p className="font-medium text-white">
-                      {examplePdfs[currentExample].name}
-                    </p>
+                    <p className="font-medium text-white">{examplePdfs[currentExample].name}</p>
                     <p className="text-sm text-slate-400">
-                      {examplePdfs[currentExample].pages} pages •{" "}
-                      {examplePdfs[currentExample].type}
+                      {examplePdfs[currentExample].pages} pages • {examplePdfs[currentExample].type}
                     </p>
                   </div>
                   <button
                     onClick={nextExample}
                     className="p-2 hover:bg-slate-600/50 rounded-lg transition-colors"
+                    aria-label="Next example"
                   >
                     <ChevronRight className="w-5 h-5 text-slate-300" />
                   </button>
@@ -352,14 +418,15 @@ const App: React.FC = () => {
               </div>
             </div>
           </div>
-          {/* Right: Summary Section */}
-          <div className="bg-[#232840] rounded-2xl shadow-lg p-8 flex flex-col">
+
+          {/* Right: Summary */}
+          <div className="bg-[#232840] rounded-2xl shadow-lg p-6 sm:p-8 flex flex-col">
             <div className="flex items-center justify-between mb-6">
               <div className="flex items-center">
                 <FileText className="w-6 h-6 text-indigo-400 mr-3" />
                 <h2 className="text-2xl font-semibold text-white">AI Summary</h2>
               </div>
-              <div className="flex space-x-2 items-center">
+              <div className="flex items-center gap-2">
                 <button
                   onClick={copyToClipboard}
                   className={`p-2 bg-[#283353] hover:bg-[#314066] rounded-lg ${
@@ -370,11 +437,7 @@ const App: React.FC = () => {
                 >
                   <Copy className="w-4 h-4" />
                 </button>
-                {copied && (
-                  <span className="text-green-400 ml-2 transition-opacity duration-300">
-                    Copied !
-                  </span>
-                )}
+                {copied && <span className="text-green-400 text-sm">Copied!</span>}
                 <button
                   onClick={() => {
                     setSummaryRaw("");
@@ -393,40 +456,34 @@ const App: React.FC = () => {
                 </button>
               </div>
             </div>
+
             {/* Error */}
-            {error && (
-              <div className="bg-red-500 text-white p-2 rounded mb-4">{error}</div>
-            )}
+            {error && <div className="bg-red-500/90 text-white p-3 rounded mb-4">{error}</div>}
+
             {/* Paywall */}
             {paywall && <PaywallNotice />}
-            {/* Summary: business-like/sectioned rendering */}
+
+            {/* Summary */}
             {!paywall && (
-              <div className="space-y-6 mb-6 max-h-[320px] overflow-y-auto px-2">
+              <div className="space-y-6 mb-6 max-h-[320px] overflow-y-auto px-1 sm:px-2">
                 {!aiSummary && !summaryRaw && !isProcessing && !error && (
-                  <div className="text-slate-400 italic">
-                    No summary yet. Upload a PDF to get started.
-                  </div>
+                  <div className="text-slate-400 italic">No summary yet. Upload a PDF to start.</div>
                 )}
                 {(aiSummary || summaryRaw) &&
                   parseSections(aiSummary || summaryRaw).map((section, idx) => (
                     <div
                       key={idx}
                       className={`rounded-xl shadow ${
-                        section.title === "Header"
-                          ? "bg-transparent text-base px-2 py-1"
-                          : "bg-[#222a3b] p-4"
+                        section.title
+                          ? "bg-[#222a3b] p-4"
+                          : "bg-transparent text-base px-2 py-1"
                       }`}
                     >
-                      {section.title && section.title !== "Header" && (
-                        <div className="font-bold text-lg mb-2 text-indigo-200">
-                          {section.title}
-                        </div>
+                      {section.title && (
+                        <div className="font-bold text-lg mb-2 text-indigo-200">{section.title}</div>
                       )}
                       <div className="prose prose-invert max-w-none text-base">
-                        <ReactMarkdown
-                          remarkPlugins={[remarkMath]}
-                          rehypePlugins={[rehypeKatex]}
-                        >
+                        <ReactMarkdown remarkPlugins={[remarkMath]} rehypePlugins={[rehypeKatex]}>
                           {section.content}
                         </ReactMarkdown>
                       </div>
@@ -434,45 +491,44 @@ const App: React.FC = () => {
                   ))}
               </div>
             )}
-            {/* Controls/Stats */}
-            <div className="space-y-6 mt-auto">
-              <div className="grid grid-cols-3 gap-4">
-                <div className="stat-item text-center">
-                  <Clock className="w-5 h-5 text-indigo-400 mx-auto mb-2" />
-                  <p className="text-sm text-slate-400">Processing Time</p>
-                  <p className="font-semibold text-white">
-                    {processingTime || "--"}
-                  </p>
-                </div>
-                <div className="stat-item text-center">
-                  <FileText className="w-5 h-5 text-blue-400 mx-auto mb-2" />
-                  <p className="text-sm text-slate-400">Word Count</p>
-                  <p className="font-semibold text-white">
-                    {wordCount || "--"}
-                  </p>
-                </div>
-                <div className="stat-item text-center">
-                  <Eye className="w-5 h-5 text-green-400 mx-auto mb-2" />
-                  <p className="text-sm text-slate-400">Pages</p>
-                  <p className="font-semibold text-white">
-                    {nbPages !== null ? nbPages : "--"}
-                  </p>
-                </div>
+
+            {/* Stats */}
+            <div className="grid grid-cols-3 gap-4 mt-auto">
+              <div className="text-center">
+                <Clock className="w-5 h-5 text-indigo-400 mx-auto mb-2" />
+                <p className="text-sm text-slate-400">Processing Time</p>
+                <p className="font-semibold text-white">{processingTime || "--"}</p>
+              </div>
+              <div className="text-center">
+                <FileText className="w-5 h-5 text-blue-400 mx-auto mb-2" />
+                <p className="text-sm text-slate-400">Word Count</p>
+                <p className="font-semibold text-white">{wordCount || "--"}</p>
+              </div>
+              <div className="text-center">
+                <Eye className="w-5 h-5 text-green-400 mx-auto mb-2" />
+                <p className="text-sm text-slate-400">Pages</p>
+                <p className="font-semibold text-white">{nbPages !== null ? nbPages : "--"}</p>
               </div>
             </div>
           </div>
         </div>
       </main>
+
       {/* Footer */}
       <footer className="bg-[#232840] rounded-2xl mx-6 mb-6 p-6">
-        <div className="flex flex-col md:flex-row items-center justify-between">
-          <div className="text-center md:text-left mb-2 md:mb-0">
+        <div className="flex flex-col md:flex-row items-center justify-between gap-3">
+          <div className="text-center md:text-left">
             <span className="text-lg font-semibold text-white">Smart PDF AI</span>
             <span className="mx-2 text-slate-400">|</span>
-            <span className="text-slate-400">© {new Date().getFullYear()} summarizeai.com</span>
+            <span className="text-slate-400">
+              © {new Date().getFullYear()} summarizeai.com
+            </span>
           </div>
           <div className="text-center md:text-right text-slate-400 text-sm">
-            For support: <a href="mailto:support@summarizeai.com" className="underline hover:text-white">support@summarizeai.com</a>
+            For support:{" "}
+            <a href="mailto:support@summarizeai.com" className="underline hover:text-white">
+              support@summarizeai.com
+            </a>
           </div>
         </div>
       </footer>
