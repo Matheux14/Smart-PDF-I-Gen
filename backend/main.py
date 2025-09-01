@@ -15,11 +15,10 @@ FREE_WORD_LIMIT = int(os.getenv("FREE_WORD_LIMIT", "50000"))
 
 # ------- Tokens (Render -> Environment) -------
 ADMIN_BYPASS_TOKEN = os.getenv("ADMIN_BYPASS_TOKEN")
-# PREMIUM_TOKENS: liste de tokens premium séparés par des virgules
 PREMIUM_TOKENS = [t.strip() for t in os.getenv("PREMIUM_TOKENS", "").split(",") if t.strip()]
 
 # ------- In-memory doc store (MVP) -------
-# doc_id -> {"text": str, "pages": int, "words": int}
+# doc_id -> {"text": str, "pages": int, "words": int, "chunks": [{"text": str, "norm": str}]}
 DOC_STORE = {}
 
 app = FastAPI(title="Smart PDF I-Gen Backend")
@@ -34,10 +33,10 @@ app.add_middleware(
     allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
-    allow_headers=["*"],  # permet x-admin-token / x-premium-token
+    allow_headers=["*"],  # x-admin-token / x-premium-token
 )
 
-# ---------- Helpers ----------
+# ---------- Auth helpers ----------
 def is_admin(request: Request) -> bool:
     if not ADMIN_BYPASS_TOKEN:
         return False
@@ -47,6 +46,7 @@ def is_premium(request: Request) -> bool:
     tok = request.headers.get("x-premium-token", "")
     return bool(tok and tok in PREMIUM_TOKENS)
 
+# ---------- Text helpers ----------
 def extract_pdf_text_sorted(pdf_path: str) -> str:
     """Extraction robuste: blocs triés (y,x) + fallback + normalisation."""
     import unicodedata
@@ -54,10 +54,9 @@ def extract_pdf_text_sorted(pdf_path: str) -> str:
     pages = []
     for page in doc:
         blocks = page.get_text("blocks") or []
-        # block = (x0, y0, x1, y1, text, block_no, ...)
-        blocks.sort(key=lambda b: (round(b[1], 1), round(b[0], 1)))
+        blocks.sort(key=lambda b: (round(b[1], 1), round(b[0], 1)))  # (y, x)
         txt = "\n".join(b[4] for b in blocks if isinstance(b[4], str) and b[4].strip())
-        if len((txt or "").strip()) < 40:  # fallback si page quasi vide
+        if len((txt or "").strip()) < 40:  # fallback si la page est quasi vide
             txt = page.get_text("text")
         txt = unicodedata.normalize("NFKC", (txt or "")).replace("\x00", "")
         pages.append(txt)
@@ -65,13 +64,13 @@ def extract_pdf_text_sorted(pdf_path: str) -> str:
     return "\n\n".join(pages)
 
 def tidy_text(s: str) -> str:
-    """Nettoie artefacts: espaces, traits répétés, répétitions aberrantes, lignes vides."""
+    """Nettoie artefacts usuels."""
     import re, unicodedata
     s = unicodedata.normalize("NFKC", s or "")
     s = s.replace("\u200b", "").replace("\x00", "")
     s = re.sub(r"[^\S\r\n]+", " ", s)               # espaces multiples -> 1
-    s = re.sub(r"[-_]{4,}", "—", s)                 # longues suites de -/_
-    s = re.sub(r"\b(\w{2,})(?:\W+\1){7,}\b", r"\1", s, flags=re.IGNORECASE)  # répétitions
+    s = re.sub(r"[-_]{4,}", "—", s)                 # longues suites de -/_ -> tiret cadratin
+    s = re.sub(r"\b(\w{2,})(?:\W+\1){7,}\b", r"\1", s, flags=re.IGNORECASE)  # répétitions folles
     s = re.sub(r"\n{3,}", "\n\n", s)                # lignes vides multiples
     return s.strip()
 
@@ -80,8 +79,66 @@ def simple_summarizer(text: str, max_sentences: int = 3) -> str:
     sentences = re.split(r'(?<=[.!?。？])\s+', (text or "").strip())
     return " ".join(sentences[:max_sentences])
 
+# ---------- Mini-RAG helpers ----------
+def _normalize(s: str) -> str:
+    import unicodedata, re
+    s = unicodedata.normalize("NFKD", s or "").encode("ascii", "ignore").decode("ascii")
+    s = s.lower()
+    s = re.sub(r"[^a-z0-9\s]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+STOPWORDS = set("""
+the a an and or of for to in into with without within over under than that this these those be is are was were been being
+on at by from as if else but not no nor so such it its itself your you we our us i me my they them their themselves he she
+him her his hers do does did done doing have has had having would could should may might can will just about around very
+de la le les un une des du au aux et ou dans sur par pour sans sous plus que qui quoi dont où lorsque lorsqué ainsi donc
+est sont était étaient être avoir avait avez avons avoirai
+""".split())
+
+def make_chunks(text: str, chunk_chars: int = 1200, overlap: int = 120):
+    """Découpe par paragraphes, regroupe jusqu’à ~chunk_chars, overlap entre blocs."""
+    paras = [p.strip() for p in text.split("\n") if p.strip()]
+    chunks, cur = [], ""
+    for p in paras:
+        if len(cur) + len(p) + 1 <= chunk_chars:
+            cur = f"{cur}\n{p}".strip()
+        else:
+            if cur:
+                chunks.append(cur)
+            # chevauchement simple
+            cur_tail = cur[-overlap:] if cur else ""
+            cur = (cur_tail + "\n" + p).strip()
+    if cur:
+        chunks.append(cur)
+    # version normalisée
+    return [{"text": c, "norm": _normalize(c)} for c in chunks]
+
+def score_chunk(norm_chunk: str, norm_query: str) -> float:
+    c_words = norm_chunk.split()
+    q_words = [w for w in norm_query.split() if w not in STOPWORDS and len(w) > 2]
+    if not q_words:
+        return 0.0
+    score = 0.0
+    for w in q_words:
+        score += c_words.count(w)
+    # petit bonus si mot rare (long)
+    score += sum(0.3 for w in q_words if len(w) >= 7 and w in norm_chunk)
+    return score
+
+def select_passages(text: str, question: str, k: int = 5, max_chars: int = 12000) -> str:
+    chunks = make_chunks(text)
+    qn = _normalize(question)
+    ranked = sorted(
+        chunks,
+        key=lambda ch: score_chunk(ch["norm"], qn),
+        reverse=True,
+    )[: max(1, k)]
+    ctx = "\n\n---\n\n".join(ch["text"] for ch in ranked)
+    return ctx[:max_chars]
+
+# ---------- LLM calls ----------
 def smart_groq_summary(text: str) -> str:
-    """Résumé IA via Groq (endpoint OpenAI-compatible)."""
     import openai
     api_key = os.environ.get("GROQ_API_KEY", "")
     if not api_key:
@@ -118,29 +175,28 @@ def smart_groq_summary(text: str) -> str:
         return f"[Groq Error] {e}"
 
 def smart_groq_qa(context: str, question: str) -> str:
-    """Q&A sur le document via Groq."""
     import openai
     api_key = os.environ.get("GROQ_API_KEY", "")
     if not api_key:
         return "[Groq Error] No API key defined"
     model = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 
-    ctx = (context or "")[:7000]
     user = (
-        "Answer the question strictly using the provided PDF context. "
-        "Cite section names if they appear. Be concise and structured.\n\n"
+        "Using ONLY the provided PDF excerpts, answer the question accurately. "
+        "Quote short snippets with “…” when useful and mention the section/page cues present in the excerpts if any. "
+        "If the context does not contain the answer, say you cannot find it in the provided passages.\n\n"
         f"Question: {question}\n\n"
-        f"PDF Context:\n{ctx}"
+        f"PDF Excerpts:\n{context}"
     )
     try:
         client = openai.OpenAI(api_key=api_key, base_url="https://api.groq.com/openai/v1")
         resp = client.chat.completions.create(
             model=model,
             messages=[
-                {"role": "system", "content": "You are a helpful assistant for answering questions about a PDF."},
+                {"role": "system", "content": "You are a careful assistant that answers from given context only."},
                 {"role": "user", "content": user},
             ],
-            max_tokens=500,
+            max_tokens=600,
             temperature=0.2,
         )
         return (resp.choices[0].message.content or "").strip()
@@ -165,27 +221,25 @@ def premium_check(request: Request):
 @app.post("/api/summarize")
 async def summarize_pdf(request: Request, file: UploadFile = File(...)):
     """
-    Upload PDF -> extract -> simple + AI summary.
-    - Stocke le texte en mémoire et renvoie doc_id
+    Upload PDF -> extract -> tidy -> simple + AI summary.
+    - Stocke texte + chunks en mémoire (doc_id) pour le Q&A
     - Bypass paywall si admin OU premium
     """
     tmp_path = None
-    doc = None
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
             content = await file.read()
             tmp.write(content)
             tmp_path = tmp.name
 
-        # Ouvrir juste pour compter les pages
+        # Compte pages
         doc = fitz.open(tmp_path)
         nb_pages = doc.page_count
         doc.close()
-        doc = None
 
         # Extraction robuste + nettoyage
-        full_text = extract_pdf_text_sorted(tmp_path)
-        full_text = tidy_text(full_text)
+        raw_text = extract_pdf_text_sorted(tmp_path)
+        full_text = tidy_text(raw_text)
         nb_words = len(full_text.split())
 
         if not full_text.strip():
@@ -194,7 +248,6 @@ async def summarize_pdf(request: Request, file: UploadFile = File(...)):
         admin_ok = is_admin(request)
         premium_ok = is_premium(request)
 
-        # Paywall si ni admin ni premium
         if (nb_pages > FREE_PAGE_LIMIT or nb_words > FREE_WORD_LIMIT) and not (admin_ok or premium_ok):
             return JSONResponse(
                 {
@@ -210,9 +263,14 @@ async def summarize_pdf(request: Request, file: UploadFile = File(...)):
         summary = simple_summarizer(full_text)
         ai_summary = smart_groq_summary(full_text)
 
-        # Store doc and return doc_id (for Q&A)
+        # Stockage + chunks pour RAG
         doc_id = uuid.uuid4().hex
-        DOC_STORE[doc_id] = {"text": full_text, "pages": nb_pages, "words": nb_words}
+        DOC_STORE[doc_id] = {
+            "text": full_text,
+            "pages": nb_pages,
+            "words": nb_words,
+            "chunks": make_chunks(full_text),
+        }
 
         return {
             "summary": summary,
@@ -228,11 +286,6 @@ async def summarize_pdf(request: Request, file: UploadFile = File(...)):
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
     finally:
-        try:
-            if doc is not None:
-                doc.close()
-        except Exception:
-            pass
         try:
             if tmp_path and os.path.exists(tmp_path):
                 os.remove(tmp_path)
@@ -261,7 +314,8 @@ async def ask_pdf(request: Request, payload: dict):
 
     context = ""
     if doc_id and doc_id in DOC_STORE:
-        context = DOC_STORE[doc_id]["text"]
+        # Récupère les meilleurs passages du doc en mémoire
+        context = select_passages(DOC_STORE[doc_id]["text"], question, k=6, max_chars=12000)
     elif context_hint:
         context = context_hint
 

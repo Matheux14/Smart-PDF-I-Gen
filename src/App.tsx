@@ -35,32 +35,39 @@ const examplePdfs = [
 /* =========================
    Utils
 ========================= */
+function tidyMarkdown(md: string) {
+  return (md || "")
+    .replace(/\u200b/g, "")
+    // cas typique: "**Title** : le contenu" -> supprimer le ":" résiduel
+    .replace(/\*\*(.+?)\*\*\s*:\s*/g, "**$1**\n\n")
+    // ":" au début de ligne (portable/desktop)
+    .replace(/^\s*[:–—\-•]+\s+/gm, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
 function parseSections(raw: string) {
+  const text = tidyMarkdown(raw);
   const regex = /\*\*(.+?)\*\*/g;
-  let match;
+  let match: RegExpExecArray | null;
   let lastIndex = 0;
   const sections: { title: string; content: string }[] = [];
-  while ((match = regex.exec(raw)) !== null) {
+
+  while ((match = regex.exec(text)) !== null) {
     if (sections.length > 0) {
-      sections[sections.length - 1].content = raw.slice(lastIndex, match.index).trim();
+      sections[sections.length - 1].content = text.slice(lastIndex, match.index).trim()
+        // supprime ponctuation parasite au début de section
+        .replace(/^\s*[:–—\-•]+\s+/, "");
     }
     sections.push({ title: match[1], content: "" });
     lastIndex = regex.lastIndex;
   }
   if (sections.length > 0) {
-    sections[sections.length - 1].content = raw.slice(lastIndex).trim();
+    sections[sections.length - 1].content = text.slice(lastIndex).trim()
+      .replace(/^\s*[:–—\-•]+\s+/, "");
   }
-  if (sections.length === 0) return [{ title: "", content: raw }];
+  if (sections.length === 0) return [{ title: "", content: text }];
   return sections;
-}
-
-// Nettoyage du markdown (supprime ":" parasites, contrôles, etc.)
-function tidyMarkdown(md: string) {
-  return (md || "")
-    .replace(/^\s*:\s+/gm, "")      // ":" en début de ligne
-    .replace(/\u200b/g, "")         // zero-width
-    .replace(/\n{3,}/g, "\n\n")     // lignes vides multiples
-    .trim();
 }
 
 /* =========================
@@ -231,7 +238,6 @@ const App: React.FC = () => {
       const formData = new FormData();
       formData.append("file", uploadedFile);
 
-      // Headers (admin + premium)
       const headers: Record<string, string> = { "Content-Type": "multipart/form-data" };
       const adminTok = localStorage.getItem("ADMIN_BYPASS_TOKEN");
       const premTok = localStorage.getItem("PREMIUM_TOKEN");
@@ -288,7 +294,7 @@ const App: React.FC = () => {
       else body.context_hint = (aiSummary || summaryRaw || "").slice(0, 6000);
 
       const r = await axios.post(`${API_URL}/api/ask`, body, { headers });
-      setAnswer(r.data?.answer || "");
+      setAnswer(tidyMarkdown(r.data?.answer || ""));
     } catch (e: any) {
       setAnswer("");
       setError(e?.response?.data?.error || "Q&A failed. Premium may be required.");
@@ -311,7 +317,7 @@ const App: React.FC = () => {
   const prevExample = () =>
     setCurrentExample((p) => (p - 1 + examplePdfs.length) % examplePdfs.length);
 
-  /* ---------- Responsive Ko-fi banner ---------- */
+  /* ---------- Banner ---------- */
   const PremiumBanner = () => (
     <div className="px-4 sm:px-6 lg:px-8 -mt-2 mb-8">
       <section
@@ -350,7 +356,6 @@ const App: React.FC = () => {
             hover:bg-pink-300 transition
             shadow-[0_10px_24px_rgba(255,80,170,.25)]
           "
-          aria-label="Upgrade via Ko-fi"
         >
           💖 Upgrade via Ko-fi
         </a>
@@ -388,7 +393,7 @@ const App: React.FC = () => {
     </div>
   );
 
-  /* ---------- Admin / Premium pills ---------- */
+  /* ---------- Pills ---------- */
   const AdminPill = () => (
     <button
       onClick={async () => {
@@ -468,7 +473,6 @@ const App: React.FC = () => {
             </div>
           </div>
 
-          {/* Switches */}
           <div className="flex gap-2 flex-wrap justify-end">
             <PremiumPill />
             <AdminPill />
@@ -476,7 +480,6 @@ const App: React.FC = () => {
         </div>
       </header>
 
-      {/* Premium Banner (masquée si admin/premium confirmé) */}
       {!hasPremium && <PremiumBanner />}
 
       {/* Main */}
@@ -489,7 +492,6 @@ const App: React.FC = () => {
               <h2 className="text-2xl font-semibold text-white">Upload Your PDF</h2>
             </div>
 
-            {/* Dropzone */}
             <div
               className={`p-8 text-center mb-6 border-2 border-dashed rounded-xl transition-colors ${
                 isDragOver ? "border-indigo-400 bg-[#1E2436]" : "border-[#33498c] bg-[#232840]"
@@ -528,7 +530,6 @@ const App: React.FC = () => {
               )}
             </div>
 
-            {/* Action */}
             <button
               onClick={handleSummarize}
               disabled={!uploadedFile || isProcessing}
@@ -552,7 +553,6 @@ const App: React.FC = () => {
               )}
             </button>
 
-            {/* Examples */}
             <div className="mt-8">
               <h3 className="text-lg font-medium text-white mb-4">Example Documents</h3>
               <div className="bg-[#20253C] rounded-xl p-4">
@@ -614,13 +614,10 @@ const App: React.FC = () => {
               </div>
             </div>
 
-            {/* Error */}
             {error && <div className="bg-red-500/90 text-white p-3 rounded mb-4">{error}</div>}
 
-            {/* Paywall (masqué si admin/premium) */}
             {paywall && !hasPremium && <PaywallNotice />}
 
-            {/* Summary */}
             {!paywall && (
               <div className="space-y-4 mb-6 max-h-[320px] overflow-y-auto px-1 sm:px-2">
                 {!aiSummary && !summaryRaw && !isProcessing && !error && (
@@ -637,7 +634,6 @@ const App: React.FC = () => {
               </div>
             )}
 
-            {/* Q&A (premium/admin only) */}
             {hasPremium && !paywall && (
               <div className="mt-4 rounded-2xl p-4 border border-white/10 bg-gradient-to-br from-violet-500/10 to-indigo-500/10">
                 <div className="flex items-center gap-2 mb-2">
@@ -673,7 +669,6 @@ const App: React.FC = () => {
               </div>
             )}
 
-            {/* Stats */}
             <div className="grid grid-cols-3 gap-4 mt-auto">
               <div className="text-center">
                 <Clock className="w-5 h-5 text-indigo-400 mx-auto mb-2" />
@@ -695,7 +690,6 @@ const App: React.FC = () => {
         </div>
       </main>
 
-      {/* Footer */}
       <footer className="bg-[#232840] rounded-2xl mx-6 mb-6 p-6">
         <div className="flex flex-col md:flex-row items-center justify-between gap-3">
           <div className="text-center md:text-left">
