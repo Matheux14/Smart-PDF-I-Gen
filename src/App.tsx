@@ -57,10 +57,26 @@ const PAYWALL_PAGES = 30;
 const PAYWALL_WORDS = 50000;
 const KO_FI_LINK = "https://ko-fi.com/konanothniel155";
 
-// IMPORTANT : on utilise la même clé d'env que côté déploiement
+// IMPORTANT : même clé d'env que côté déploiement
 const API_URL =
-  import.meta.env.VITE_API_BASE_URL ||
-  "https://smart-pdf-i-gen-1.onrender.com"; // fallback sûr
+  import.meta.env.VITE_API_BASE_URL || "https://smart-pdf-i-gen-1.onrender.com";
+
+/* =========================
+   Helpers
+========================= */
+// Validation côté serveur du token admin
+async function validateAdmin(): Promise<boolean> {
+  const token = localStorage.getItem("ADMIN_BYPASS_TOKEN");
+  if (!token) return false;
+  try {
+    const r = await axios.get(`${API_URL}/auth/check`, {
+      headers: { "x-admin-token": token },
+    });
+    return !!r.data?.admin;
+  } catch {
+    return false;
+  }
+}
 
 /* =========================
    Component
@@ -80,14 +96,14 @@ const App: React.FC = () => {
   const [copied, setCopied] = useState(false);
   const [paywall, setPaywall] = useState(false);
 
-  // Admin
+  // Admin (validé par le serveur)
   const [adminOn, setAdminOn] = useState<boolean>(false);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
-    // Activer le mode admin si un token est présent dans le navigateur
-    setAdminOn(!!localStorage.getItem("ADMIN_BYPASS_TOKEN"));
+    // Au chargement, on demande au serveur si le token local est valide
+    validateAdmin().then(setAdminOn);
   }, []);
 
   /* ---------- Drag & Drop ---------- */
@@ -164,8 +180,7 @@ const App: React.FC = () => {
         setError("");
       } else {
         setError(
-          err?.response?.data?.error ||
-            "PDF analysis failed. Please try again or use a smaller file."
+          err?.response?.data?.error || "PDF analysis failed. Please try again or use a smaller file."
         );
       }
     } finally {
@@ -267,7 +282,7 @@ const App: React.FC = () => {
   /* ---------- Admin pill ---------- */
   const AdminPill = () => (
     <button
-      onClick={() => {
+      onClick={async () => {
         if (adminOn) {
           localStorage.removeItem("ADMIN_BYPASS_TOKEN");
           setAdminOn(false);
@@ -275,7 +290,9 @@ const App: React.FC = () => {
           const t = prompt("Enter admin token (matches ADMIN_BYPASS_TOKEN on Render)");
           if (t && t.trim()) {
             localStorage.setItem("ADMIN_BYPASS_TOKEN", t.trim());
-            setAdminOn(true);
+            const ok = await validateAdmin();
+            setAdminOn(ok);
+            if (!ok) alert("Invalid token.");
           }
         }
       }}
@@ -313,8 +330,8 @@ const App: React.FC = () => {
         </div>
       </header>
 
-      {/* Premium Banner */}
-      <PremiumBanner />
+      {/* Premium Banner — masquée pour l'admin validé */}
+      {!adminOn && <PremiumBanner />}
 
       {/* Main */}
       <main className="flex-1 max-w-7xl mx-auto px-6 pb-16 w-full">
@@ -460,8 +477,8 @@ const App: React.FC = () => {
             {/* Error */}
             {error && <div className="bg-red-500/90 text-white p-3 rounded mb-4">{error}</div>}
 
-            {/* Paywall */}
-            {paywall && <PaywallNotice />}
+            {/* Paywall — masqué pour l'admin validé */}
+            {paywall && !adminOn && <PaywallNotice />}
 
             {/* Summary */}
             {!paywall && (
@@ -474,9 +491,7 @@ const App: React.FC = () => {
                     <div
                       key={idx}
                       className={`rounded-xl shadow ${
-                        section.title
-                          ? "bg-[#222a3b] p-4"
-                          : "bg-transparent text-base px-2 py-1"
+                        section.title ? "bg-[#222a3b] p-4" : "bg-transparent text-base px-2 py-1"
                       }`}
                     >
                       {section.title && (
@@ -520,9 +535,7 @@ const App: React.FC = () => {
           <div className="text-center md:text-left">
             <span className="text-lg font-semibold text-white">Smart PDF AI</span>
             <span className="mx-2 text-slate-400">|</span>
-            <span className="text-slate-400">
-              © {new Date().getFullYear()} summarizeai.com
-            </span>
+            <span className="text-slate-400">© {new Date().getFullYear()} summarizeai.com</span>
           </div>
           <div className="text-center md:text-right text-slate-400 text-sm">
             For support:{" "}

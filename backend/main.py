@@ -1,4 +1,4 @@
-from fastapi import FastAPI, File, UploadFile
+from fastapi import FastAPI, File, UploadFile, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import tempfile
@@ -8,56 +8,57 @@ import fitz  # PyMuPDF
 from dotenv import load_dotenv
 load_dotenv()
 
-# --- Limites gratuites ---
-FREE_PAGE_LIMIT = 30
-FREE_WORD_LIMIT = 50_000
+# --- Limites gratuites via ENV (modifiable sur Render) ---
+FREE_PAGE_LIMIT = int(os.getenv("FREE_PAGE_LIMIT", "30"))
+FREE_WORD_LIMIT = int(os.getenv("FREE_WORD_LIMIT", "50000"))
+
+# --- Admin bypass token (Render -> Environment) ---
+ADMIN_BYPASS_TOKEN = os.getenv("ADMIN_BYPASS_TOKEN")
 
 app = FastAPI(title="Smart PDF I-Gen Backend")
 
-# --- CORS : origines autorisées (dev + front en prod) ---
-# NB: on autorise le front Vercel et le dev local. Le domaine backend n'est pas requis pour CORS.
+# --- CORS ---
 origins = [
     "http://localhost:5173",
     "http://127.0.0.1:5173",
     "https://smart-pdf-i-gen.vercel.app",
-    # (facultatif) si tu as un autre front, ajoute-le ici
 ]
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
-    allow_credentials=True,   # mets False si tu n'utilises pas de cookies/credentials
+    allow_credentials=True,
     allow_methods=["*"],
-    allow_headers=["*"],
+    allow_headers=["*"],  # x-admin-token autorisé
 )
 
 @app.get("/ping")
 def ping():
-    """Health check route"""
     return {"pong": True, "model": os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")}
 
+# --- Nouveau : endpoint de validation admin ---
+@app.get("/auth/check")
+def auth_check(request: Request):
+    token = request.headers.get("x-admin-token")
+    ok = bool(ADMIN_BYPASS_TOKEN) and (token == ADMIN_BYPASS_TOKEN)
+    return {"admin": ok}
+
 @app.post("/api/summarize")
-async def summarize_pdf(file: UploadFile = File(...)):
+async def summarize_pdf(request: Request, file: UploadFile = File(...)):
     """
-    Réception d'un PDF, extraction du texte, puis double résumé :
-      - simple_summarizer : heuristique rapide (3 phrases)
-      - smart_groq_summary : appel Groq (LLM)
+    Upload PDF -> extract -> simple + AI summary.
+    Admin bypass: si x-admin-token valide, ignore les limites gratuites.
     """
     tmp_path = None
     doc = None
 
     try:
-        # 1) Sauvegarde temporaire du PDF
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
             content = await file.read()
             tmp.write(content)
             tmp_path = tmp.name
 
-        # 2) Extraction du texte
         doc = fitz.open(tmp_path)
-        full_text_parts = []
-        for page in doc:
-            full_text_parts.append(page.get_text())
+        full_text_parts = [page.get_text() for page in doc]
         nb_pages = doc.page_count
         full_text = " ".join(full_text_parts)
         nb_words = len(full_text.split())
@@ -65,20 +66,26 @@ async def summarize_pdf(file: UploadFile = File(...)):
         if not full_text.strip():
             return JSONResponse({"error": "The PDF is empty or unreadable."}, status_code=400)
 
-        # 3) Paywall : limites gratuites
-        if nb_pages > FREE_PAGE_LIMIT or nb_words > FREE_WORD_LIMIT:
+        # --- Admin bypass ---
+        is_admin = bool(ADMIN_BYPASS_TOKEN) and (
+            request.headers.get("x-admin-token") == ADMIN_BYPASS_TOKEN
+        )
+
+        # Paywall (s’applique seulement si pas admin)
+        if (nb_pages > FREE_PAGE_LIMIT or nb_words > FREE_WORD_LIMIT) and not is_admin:
             return JSONResponse(
                 {
-                    "error": "This document exceeds the free limit (30 pages or 50,000 words). Please subscribe to continue.",
+                    "error": f"This document exceeds the free limit ({FREE_PAGE_LIMIT} pages or {FREE_WORD_LIMIT} words).",
                     "paywall": True,
                     "nb_pages": nb_pages,
                     "nb_words": nb_words,
                 },
-                status_code=402,  # 402 Payment Required
+                status_code=402,
             )
 
-        # 4) Résumés
+        # Résumé simple
         summary = simple_summarizer(full_text)
+        # Résumé IA
         ai_summary = smart_groq_summary(full_text)
 
         return {
@@ -87,13 +94,12 @@ async def summarize_pdf(file: UploadFile = File(...)):
             "nb_pages": nb_pages,
             "nb_words": nb_words,
             "paywall": False,
+            "admin_bypass": is_admin,
         }
 
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
-
     finally:
-        # Nettoyage (sécurité)
         try:
             if doc is not None:
                 doc.close()
@@ -105,25 +111,17 @@ async def summarize_pdf(file: UploadFile = File(...)):
         except Exception:
             pass
 
-
 # ------------------ Helpers ------------------
 
 def simple_summarizer(text: str, max_sentences: int = 3) -> str:
-    """
-    Petit résumé heuristique : prend les premières phrases du texte.
-    """
     import re
-    # Split en phrases multilingues (., !, ?, ponctuations asiatiques)
     sentences = re.split(r'(?<=[.!?。？])\s+', text.strip())
     return " ".join(sentences[:max_sentences])
 
-
 def smart_groq_summary(text: str) -> str:
     """
-    Appel à l'API Groq (endpoint OpenAI-compatible) pour un résumé structuré.
-    - Utilise GROQ_API_KEY (obligatoire)
-    - Utilise GROQ_MODEL (optionnel, défaut: llama-3.3-70b-versatile)
-    - IMPORTANT (SDK OpenAI) : utiliser max_tokens, pas max_completion_tokens.
+    Appel Groq via endpoint OpenAI-compatible.
+    SDK OpenAI -> utiliser max_tokens.
     """
     import openai
 
@@ -132,8 +130,6 @@ def smart_groq_summary(text: str) -> str:
         return "[Groq Error] No API key defined"
 
     model = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
-
-    # On tronque pour éviter d'envoyer des documents gigantesques en entrée
     head = text[:6000]
 
     prompt = (
@@ -151,21 +147,17 @@ def smart_groq_summary(text: str) -> str:
     try:
         client = openai.OpenAI(
             api_key=api_key,
-            base_url="https://api.groq.com/openai/v1",  # OpenAI-compatible
+            base_url="https://api.groq.com/openai/v1",
         )
         resp = client.chat.completions.create(
             model=model,
             messages=[
-                {
-                    "role": "system",
-                    "content": "You are an expert at summarizing professional and academic documents in all languages.",
-                },
+                {"role": "system", "content": "You are an expert at summarizing professional and academic documents in all languages."},
                 {"role": "user", "content": prompt},
             ],
-            max_tokens=600,   # <- SDK OpenAI attend max_tokens
+            max_tokens=600,   # (SDK OpenAI)
             temperature=0.2,
         )
         return (resp.choices[0].message.content or "").strip()
-
     except Exception as e:
         return f"[Groq Error] {e}"
