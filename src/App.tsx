@@ -38,16 +38,20 @@ const examplePdfs = [
 function tidyMarkdown(md: string) {
   return (md || "")
     .replace(/\u200b/g, "")
-    // cas typique: "**Title** : le contenu" -> supprimer le ":" résiduel
-    .replace(/\*\*(.+?)\*\*\s*:\s*/g, "**$1**\n\n")
-    // ":" au début de ligne (portable/desktop)
-    .replace(/^\s*[:–—\-•]+\s+/gm, "")
+    .replace(/\*\*(.+?)\*\*\s*:\s*/g, "**$1**\n\n") // retire ":" après un titre en gras
+    .replace(/^\s*[:–—\-•]+\s+/gm, "")             // retire ":" / puces au début de ligne
     .replace(/\n{3,}/g, "\n\n")
     .trim();
 }
 
 function parseSections(raw: string) {
   const text = tidyMarkdown(raw);
+  // S'il n'y a pas de titres en gras, on force une structure par défaut
+  if (!/\*\*(.+?)\*\*/.test(text)) {
+    return [
+      { title: "Executive summary (2–3 sentences)", content: text },
+    ];
+  }
   const regex = /\*\*(.+?)\*\*/g;
   let match: RegExpExecArray | null;
   let lastIndex = 0;
@@ -56,7 +60,6 @@ function parseSections(raw: string) {
   while ((match = regex.exec(text)) !== null) {
     if (sections.length > 0) {
       sections[sections.length - 1].content = text.slice(lastIndex, match.index).trim()
-        // supprime ponctuation parasite au début de section
         .replace(/^\s*[:–—\-•]+\s+/, "");
     }
     sections.push({ title: match[1], content: "" });
@@ -66,12 +69,11 @@ function parseSections(raw: string) {
     sections[sections.length - 1].content = text.slice(lastIndex).trim()
       .replace(/^\s*[:–—\-•]+\s+/, "");
   }
-  if (sections.length === 0) return [{ title: "", content: text }];
   return sections;
 }
 
 /* =========================
-   Constants (client)
+   Constants
 ========================= */
 const PAYWALL_PAGES = 30;
 const PAYWALL_WORDS = 50000;
@@ -87,9 +89,7 @@ async function validateAdmin(): Promise<boolean> {
   const token = localStorage.getItem("ADMIN_BYPASS_TOKEN");
   if (!token) return false;
   try {
-    const r = await axios.get(`${API_URL}/auth/check`, {
-      headers: { "x-admin-token": token },
-    });
+    const r = await axios.get(`${API_URL}/auth/check`, { headers: { "x-admin-token": token } });
     return !!r.data?.admin;
   } catch {
     return false;
@@ -109,20 +109,16 @@ async function validatePremium(): Promise<boolean> {
 }
 
 /* =========================
-   Pretty Section Card
+   UI helpers
 ========================= */
 function sectionIcon(title: string) {
   const t = title.toLowerCase();
   if (t.includes("executive")) return <Lightbulb className="w-5 h-5 text-amber-300" />;
-  if (t.includes("key") || t.includes("results")) return <Target className="w-5 h-5 text-sky-300" />;
+  if (t.includes("key") || t.includes("result")) return <Target className="w-5 h-5 text-sky-300" />;
   if (t.includes("recommend")) return <CheckCircle2 className="w-5 h-5 text-emerald-300" />;
   return <FileText className="w-5 h-5 text-indigo-300" />;
 }
-
-const SectionCard: React.FC<{ title?: string; children: React.ReactNode }> = ({
-  title,
-  children,
-}) => {
+const SectionCard: React.FC<{ title?: string; children: React.ReactNode }> = ({ title, children }) => {
   const accent =
     title?.toLowerCase().includes("executive")
       ? "from-amber-500/15 to-rose-500/10"
@@ -133,9 +129,7 @@ const SectionCard: React.FC<{ title?: string; children: React.ReactNode }> = ({
       : "from-slate-500/10 to-slate-500/5";
 
   return (
-    <div
-      className={`rounded-2xl p-4 bg-gradient-to-br ${accent} border border-white/10 shadow-[0_6px_24px_rgba(0,0,0,.25)] transition-transform duration-150 hover:-translate-y-0.5`}
-    >
+    <div className={`rounded-2xl p-4 bg-gradient-to-br ${accent} border border-white/10 shadow-[0_6px_24px_rgba(0,0,0,.25)] transition-transform duration-150 hover:-translate-y-0.5`}>
       {title && (
         <div className="flex items-center gap-2 mb-2">
           {sectionIcon(title)}
@@ -167,7 +161,6 @@ const App: React.FC = () => {
   const [copied, setCopied] = useState(false);
   const [paywall, setPaywall] = useState(false);
 
-  // Admin / Premium (confirmés par le serveur)
   const [adminOn, setAdminOn] = useState<boolean>(false);
   const [premiumOn, setPremiumOn] = useState<boolean>(false);
 
@@ -185,31 +178,17 @@ const App: React.FC = () => {
   }, []);
 
   /* ---------- Drag & Drop ---------- */
-  const handleDragOver = (e: React.DragEvent) => {
-    e.preventDefault();
-    setIsDragOver(true);
-  };
-  const handleDragLeave = (e: React.DragEvent) => {
-    e.preventDefault();
-    setIsDragOver(false);
-  };
+  const handleDragOver = (e: React.DragEvent) => { e.preventDefault(); setIsDragOver(true); };
+  const handleDragLeave = (e: React.DragEvent) => { e.preventDefault(); setIsDragOver(false); };
   const handleDrop = (e: React.DragEvent) => {
-    e.preventDefault();
-    setIsDragOver(false);
+    e.preventDefault(); setIsDragOver(false);
     const files = e.dataTransfer.files;
-    if (files.length > 0 && files[0].type === "application/pdf") {
-      setUploadedFile(files[0]);
-      resetAll();
-    }
+    if (files.length > 0 && files[0].type === "application/pdf") { setUploadedFile(files[0]); resetAll(); }
   };
 
   /* ---------- File select ---------- */
   const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const files = e.target.files;
-    if (files && files.length > 0) {
-      setUploadedFile(files[0]);
-      resetAll();
-    }
+    const files = e.target.files; if (files && files.length > 0) { setUploadedFile(files[0]); resetAll(); }
   };
   const handleUploadClick = () => fileInputRef.current?.click();
 
@@ -229,9 +208,7 @@ const App: React.FC = () => {
   /* ---------- Upload & Summarize ---------- */
   const handleSummarize = async () => {
     if (!uploadedFile) return;
-    setIsProcessing(true);
-    setError("");
-    setPaywall(false);
+    setIsProcessing(true); setError(""); setPaywall(false);
 
     try {
       const t0 = performance.now();
@@ -249,7 +226,7 @@ const App: React.FC = () => {
 
       setProcessingTime(((t1 - t0) / 1000).toFixed(1) + "s");
       setSummaryRaw(tidyMarkdown(res.data.summary || ""));
-      setAiSummary(tidyMarkdown(res.data.ai_summary || ""));
+      setAiSummary(tidyMarkdown(res.data.ai_summary || "")); // toujours stable
       setWordCount(res.data.nb_words || 0);
       setNbPages(res.data.nb_pages ?? null);
       setPaywall(!!res.data.paywall);
@@ -265,10 +242,7 @@ const App: React.FC = () => {
         setWordCount(err?.response?.data?.nb_words ?? 0);
         setError("");
       } else {
-        setError(
-          err?.response?.data?.error ||
-            "PDF analysis failed. Please try again or use a smaller file."
-        );
+        setError(err?.response?.data?.error || "PDF analysis failed. Please try again or use a smaller file.");
       }
     } finally {
       setIsProcessing(false);
@@ -278,9 +252,7 @@ const App: React.FC = () => {
   /* ---------- Q&A ---------- */
   const handleAsk = async () => {
     if (!question.trim()) return;
-    setQaLoading(true);
-    setAnswer("");
-    setError("");
+    setQaLoading(true); setAnswer(""); setError("");
 
     try {
       const headers: Record<string, string> = { "Content-Type": "application/json" };
@@ -290,8 +262,7 @@ const App: React.FC = () => {
       if (premTok) headers["x-premium-token"] = premTok;
 
       const body: any = { question: question.trim() };
-      if (docId) body.doc_id = docId;
-      else body.context_hint = (aiSummary || summaryRaw || "").slice(0, 6000);
+      if (docId) body.doc_id = docId; else body.context_hint = (aiSummary || summaryRaw || "").slice(0, 6000);
 
       const r = await axios.post(`${API_URL}/api/ask`, body, { headers });
       setAnswer(tidyMarkdown(r.data?.answer || ""));
@@ -314,51 +285,20 @@ const App: React.FC = () => {
 
   /* ---------- Carousel ---------- */
   const nextExample = () => setCurrentExample((p) => (p + 1) % examplePdfs.length);
-  const prevExample = () =>
-    setCurrentExample((p) => (p - 1 + examplePdfs.length) % examplePdfs.length);
+  const prevExample = () => setCurrentExample((p) => (p - 1 + examplePdfs.length) % examplePdfs.length);
 
   /* ---------- Banner ---------- */
   const PremiumBanner = () => (
     <div className="px-4 sm:px-6 lg:px-8 -mt-2 mb-8">
-      <section
-        className="
-          w-full max-w-4xl mx-auto
-          rounded-2xl border border-white/10
-          bg-gradient-to-br from-fuchsia-500/15 via-indigo-500/10 to-cyan-400/10
-          p-4 sm:p-5 lg:p-6 shadow-[0_6px_24px_rgba(0,0,0,.25)]
-          flex flex-wrap items-center gap-3 sm:gap-4
-        "
-        role="complementary"
-        aria-label="Premium upsell"
-      >
+      <section className="w-full max-w-4xl mx-auto rounded-2xl border border-white/10 bg-gradient-to-br from-fuchsia-500/15 via-indigo-500/10 to-cyan-400/10 p-4 sm:p-5 lg:p-6 shadow-[0_6px_24px_rgba(0,0,0,.25)] flex flex-wrap items-center gap-3 sm:gap-4">
         <div className="flex items-start gap-3 flex-1 min-w-[220px]">
-          <span className="text-xl sm:text-2xl" aria-hidden>
-            🚀
-          </span>
+          <span className="text-xl sm:text-2xl" aria-hidden>🚀</span>
           <div>
-            <h3 className="m-0 font-bold text-base sm:text-lg text-white">
-              Want unlimited large PDF summaries & AI-powered Q&A?
-            </h3>
-            <p className="m-0 mt-1 text-xs sm:text-sm text-slate-300">
-              Supporting us unlocks premium features and helps this project grow.
-            </p>
+            <h3 className="m-0 font-bold text-base sm:text-lg text-white">Want unlimited large PDF summaries & AI-powered Q&A?</h3>
+            <p className="m-0 mt-1 text-xs sm:text-sm text-slate-300">Supporting us unlocks premium features and helps this project grow.</p>
           </div>
         </div>
-
-        <a
-          href={KO_FI_LINK}
-          target="_blank"
-          rel="noreferrer"
-          className="
-            inline-flex items-center justify-center
-            px-4 sm:px-5 py-2 rounded-xl font-bold
-            bg-pink-400 text-slate-900
-            hover:bg-pink-300 transition
-            shadow-[0_10px_24px_rgba(255,80,170,.25)]
-          "
-        >
-          💖 Upgrade via Ko-fi
-        </a>
+        <a href="https://ko-fi.com/konanothniel155" target="_blank" rel="noreferrer" className="inline-flex items-center justify-center px-4 sm:px-5 py-2 rounded-xl font-bold bg-pink-400 text-slate-900 hover:bg-pink-300 transition shadow-[0_10px_24px_rgba(255,80,170,.25)]">💖 Upgrade via Ko-fi</a>
       </section>
     </div>
   );
@@ -371,25 +311,11 @@ const App: React.FC = () => {
         This document has <b>{nbPages}</b> pages ({wordCount} words).<br />
         The free limit is <b>{PAYWALL_PAGES} pages</b> or <b>{PAYWALL_WORDS} words</b>.
       </p>
-      <p className="mb-4 font-semibold">
-        <span className="text-red-700">
-          Please support the project or unlock large document processing via Ko-fi (PayPal, Mobile
-          Money, cards).
-        </span>
-      </p>
+      <p className="mb-4 font-semibold"><span className="text-red-700">Please support the project or unlock large document processing via Ko-fi (PayPal, Mobile Money, cards).</span></p>
       <div className="flex flex-col sm:flex-row items-center justify-center gap-3">
-        <a
-          href={KO_FI_LINK}
-          target="_blank"
-          rel="noopener noreferrer"
-          className="inline-block bg-pink-500 hover:bg-pink-600 text-white px-6 py-3 rounded-xl font-bold shadow transition"
-        >
-          💖 Support / Unlock with Ko-fi
-        </a>
+        <a href="https://ko-fi.com/konanothniel155" target="_blank" rel="noopener noreferrer" className="inline-block bg-pink-500 hover:bg-pink-600 text-white px-6 py-3 rounded-xl font-bold shadow transition">💖 Support / Unlock with Ko-fi</a>
       </div>
-      <p className="text-xs mt-4">
-        After payment, contact us (WhatsApp, email, or Ko-fi) to activate your premium access.
-      </p>
+      <p className="text-xs mt-4">After payment, contact us (WhatsApp, email, or Ko-fi) to activate your premium access.</p>
     </div>
   );
 
@@ -397,25 +323,17 @@ const App: React.FC = () => {
   const AdminPill = () => (
     <button
       onClick={async () => {
-        if (adminOn) {
-          localStorage.removeItem("ADMIN_BYPASS_TOKEN");
-          setAdminOn(false);
-        } else {
+        if (adminOn) { localStorage.removeItem("ADMIN_BYPASS_TOKEN"); setAdminOn(false); }
+        else {
           const t = prompt("Enter admin token (matches ADMIN_BYPASS_TOKEN on Render)");
           if (t && t.trim()) {
             localStorage.setItem("ADMIN_BYPASS_TOKEN", t.trim());
-            const ok = await validateAdmin();
-            setAdminOn(ok);
-            if (!ok) {
-              alert("Invalid admin token.");
-              localStorage.removeItem("ADMIN_BYPASS_TOKEN");
-            }
+            const ok = await validateAdmin(); setAdminOn(ok);
+            if (!ok) { alert("Invalid admin token."); localStorage.removeItem("ADMIN_BYPASS_TOKEN"); }
           }
         }
       }}
-      className={`inline-flex items-center gap-2 px-3 py-1.5 rounded-full border text-sm font-semibold
-        ${adminOn ? "border-emerald-400/40 text-emerald-300 bg-emerald-600/10" : "border-white/15 text-slate-300 bg-white/5"}
-      `}
+      className={`inline-flex items-center gap-2 px-3 py-1.5 rounded-full border text-sm font-semibold ${adminOn ? "border-emerald-400/40 text-emerald-300 bg-emerald-600/10" : "border-white/15 text-slate-300 bg-white/5"}`}
       title="Toggle admin bypass"
     >
       <ShieldCheck className="w-4 h-4" />
@@ -426,25 +344,17 @@ const App: React.FC = () => {
   const PremiumPill = () => (
     <button
       onClick={async () => {
-        if (premiumOn) {
-          localStorage.removeItem("PREMIUM_TOKEN");
-          setPremiumOn(false);
-        } else {
+        if (premiumOn) { localStorage.removeItem("PREMIUM_TOKEN"); setPremiumOn(false); }
+        else {
           const t = prompt("Enter premium token");
           if (t && t.trim()) {
             localStorage.setItem("PREMIUM_TOKEN", t.trim());
-            const ok = await validatePremium();
-            setPremiumOn(ok);
-            if (!ok) {
-              alert("Invalid premium token.");
-              localStorage.removeItem("PREMIUM_TOKEN");
-            }
+            const ok = await validatePremium(); setPremiumOn(ok);
+            if (!ok) { alert("Invalid premium token."); localStorage.removeItem("PREMIUM_TOKEN"); }
           }
         }
       }}
-      className={`inline-flex items-center gap-2 px-3 py-1.5 rounded-full border text-sm font-semibold
-        ${premiumOn ? "border-fuchsia-400/40 text-fuchsia-300 bg-fuchsia-600/10" : "border-white/15 text-slate-300 bg-white/5"}
-      `}
+      className={`inline-flex items-center gap-2 px-3 py-1.5 rounded-full border text-sm font-semibold ${premiumOn ? "border-fuchsia-400/40 text-fuchsia-300 bg-fuchsia-600/10" : "border-white/15 text-slate-300 bg-white/5"}`}
       title="Toggle premium"
     >
       <ShieldCheck className="w-4 h-4" />
@@ -493,30 +403,20 @@ const App: React.FC = () => {
             </div>
 
             <div
-              className={`p-8 text-center mb-6 border-2 border-dashed rounded-xl transition-colors ${
-                isDragOver ? "border-indigo-400 bg-[#1E2436]" : "border-[#33498c] bg-[#232840]"
-              }`}
+              className={`p-8 text-center mb-6 border-2 border-dashed rounded-xl transition-colors ${isDragOver ? "border-indigo-400 bg-[#1E2436]" : "border-[#33498c] bg-[#232840]"}`}
               onDragOver={handleDragOver}
               onDragLeave={handleDragLeave}
               onDrop={handleDrop}
               onClick={handleUploadClick}
               style={{ cursor: "pointer" }}
             >
-              <input
-                ref={fileInputRef}
-                type="file"
-                accept=".pdf"
-                onChange={handleFileSelect}
-                className="hidden"
-              />
+              <input ref={fileInputRef} type="file" accept=".pdf" onChange={handleFileSelect} className="hidden" />
               {uploadedFile ? (
                 <div className="space-y-3">
                   <FileCheck className="w-16 h-16 text-green-400 mx-auto" />
                   <div>
                     <p className="text-lg font-medium text-white break-all">{uploadedFile.name}</p>
-                    <p className="text-slate-400">
-                      {(uploadedFile.size / 1024 / 1024).toFixed(2)} MB
-                    </p>
+                    <p className="text-slate-400">{(uploadedFile.size / 1024 / 1024).toFixed(2)} MB</p>
                   </div>
                 </div>
               ) : (
@@ -533,12 +433,10 @@ const App: React.FC = () => {
             <button
               onClick={handleSummarize}
               disabled={!uploadedFile || isProcessing}
-              className={`w-full py-3 rounded-xl font-bold shadow transition text-lg mt-1
-                ${
-                  !uploadedFile || isProcessing
-                    ? "bg-indigo-900/60 text-[#b7cbfa] cursor-not-allowed"
-                    : "bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-indigo-700 hover:to-blue-700 text-white"
-                }`}
+              className={`w-full py-3 rounded-xl font-bold shadow transition text-lg mt-1 ${
+                !uploadedFile || isProcessing ? "bg-indigo-900/60 text-[#b7cbfa] cursor-not-allowed"
+                : "bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-indigo-700 hover:to-blue-700 text-white"
+              }`}
             >
               {isProcessing ? (
                 <div className="flex items-center justify-center">
@@ -557,24 +455,14 @@ const App: React.FC = () => {
               <h3 className="text-lg font-medium text-white mb-4">Example Documents</h3>
               <div className="bg-[#20253C] rounded-xl p-4">
                 <div className="flex items-center justify-between">
-                  <button
-                    onClick={prevExample}
-                    className="p-2 hover:bg-slate-600/50 rounded-lg transition-colors"
-                    aria-label="Previous example"
-                  >
+                  <button onClick={prevExample} className="p-2 hover:bg-slate-600/50 rounded-lg transition-colors" aria-label="Previous example">
                     <ChevronLeft className="w-5 h-5 text-slate-300" />
                   </button>
                   <div className="text-center flex-1">
                     <p className="font-medium text-white">{examplePdfs[currentExample].name}</p>
-                    <p className="text-sm text-slate-400">
-                      {examplePdfs[currentExample].pages} pages • {examplePdfs[currentExample].type}
-                    </p>
+                    <p className="text-sm text-slate-400">{examplePdfs[currentExample].pages} pages • {examplePdfs[currentExample].type}</p>
                   </div>
-                  <button
-                    onClick={nextExample}
-                    className="p-2 hover:bg-slate-600/50 rounded-lg transition-colors"
-                    aria-label="Next example"
-                  >
+                  <button onClick={nextExample} className="p-2 hover:bg-slate-600/50 rounded-lg transition-colors" aria-label="Next example">
                     <ChevronRight className="w-5 h-5 text-slate-300" />
                   </button>
                 </div>
@@ -592,31 +480,21 @@ const App: React.FC = () => {
               <div className="flex items-center gap-2">
                 <button
                   onClick={copyToClipboard}
-                  className={`p-2 bg-[#283353] hover:bg-[#314066] rounded-lg ${
-                    !(aiSummary || summaryRaw) ? "opacity-50 cursor-not-allowed" : ""
-                  }`}
+                  className={`p-2 bg-[#283353] hover:bg-[#314066] rounded-lg ${!(aiSummary || summaryRaw) ? "opacity-50 cursor-not-allowed" : ""}`}
                   title="Copy to clipboard"
                   disabled={!(aiSummary || summaryRaw)}
                 >
                   <Copy className="w-4 h-4" />
                 </button>
                 {copied && <span className="text-green-400 text-sm">Copied!</span>}
-                <button
-                  onClick={() => {
-                    resetAll();
-                    setUploadedFile(null);
-                  }}
-                  className="p-2 bg-[#283353] hover:bg-[#314066] rounded-lg"
-                  title="Reset"
-                >
+                <button onClick={() => { resetAll(); setUploadedFile(null); }} className="p-2 bg-[#283353] hover:bg-[#314066] rounded-lg" title="Reset">
                   <RefreshCw className="w-4 h-4" />
                 </button>
               </div>
             </div>
 
             {error && <div className="bg-red-500/90 text-white p-3 rounded mb-4">{error}</div>}
-
-            {paywall && !hasPremium && <PaywallNotice />}
+            {paywall && !(adminOn || premiumOn) && <PaywallNotice />}
 
             {!paywall && (
               <div className="space-y-4 mb-6 max-h-[320px] overflow-y-auto px-1 sm:px-2">
@@ -634,7 +512,7 @@ const App: React.FC = () => {
               </div>
             )}
 
-            {hasPremium && !paywall && (
+            {(adminOn || premiumOn) && !paywall && (
               <div className="mt-4 rounded-2xl p-4 border border-white/10 bg-gradient-to-br from-violet-500/10 to-indigo-500/10">
                 <div className="flex items-center gap-2 mb-2">
                   <MessageSquare className="w-5 h-5 text-violet-300" />
@@ -644,19 +522,23 @@ const App: React.FC = () => {
                   <input
                     value={question}
                     onChange={(e) => setQuestion(e.target.value)}
-                    placeholder="Ask a precise question..."
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" && !e.shiftKey) {
+                        e.preventDefault();
+                        if (!qaLoading) handleAsk();
+                      }
+                    }}
+                    placeholder="Ask a precise question… (Press Enter to send)"
                     className="flex-1 rounded-xl bg-[#1e2540] border border-white/10 px-3 py-2 outline-none focus:ring-2 ring-indigo-500/40"
                   />
                   <button
                     onClick={handleAsk}
                     disabled={!question.trim() || qaLoading}
                     className={`px-4 py-2 rounded-xl font-semibold ${
-                      !question.trim() || qaLoading
-                        ? "bg-indigo-900/60 text-[#b7cbfa] cursor-not-allowed"
-                        : "bg-indigo-600 hover:bg-indigo-500 text-white"
+                      !question.trim() || qaLoading ? "bg-indigo-900/60 text-[#b7cbfa] cursor-not-allowed" : "bg-indigo-600 hover:bg-indigo-500 text-white"
                     }`}
                   >
-                    {qaLoading ? "Thinking..." : "Ask AI"}
+                    {qaLoading ? "Thinking…" : "Ask AI"}
                   </button>
                 </div>
                 {answer && (
@@ -695,15 +577,10 @@ const App: React.FC = () => {
           <div className="text-center md:text-left">
             <span className="text-lg font-semibold text-white">Smart PDF AI</span>
             <span className="mx-2 text-slate-400">|</span>
-            <span className="text-slate-400">
-              © {new Date().getFullYear()} smart-pdf-i-gen.vercel.app
-            </span>
+            <span className="text-slate-400">© {new Date().getFullYear()} smart-pdf-i-gen.vercel.app</span>
           </div>
           <div className="text-center md:text-right text-slate-400 text-sm">
-            For support:{" "}
-            <a href="mailto:smartpdfigen@gmail.com" className="underline hover:text-white">
-              smartpdfigen@gmail.com
-            </a>
+            For support: <a href="mailto:smartpdfigen@gmail.com" className="underline hover:text-white">smartpdfigen@gmail.com</a>
           </div>
         </div>
       </footer>

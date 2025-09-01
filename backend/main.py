@@ -5,6 +5,9 @@ import tempfile
 import os
 import fitz  # PyMuPDF
 import uuid
+import json
+import re
+from difflib import SequenceMatcher
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -56,7 +59,7 @@ def extract_pdf_text_sorted(pdf_path: str) -> str:
         blocks = page.get_text("blocks") or []
         blocks.sort(key=lambda b: (round(b[1], 1), round(b[0], 1)))  # (y, x)
         txt = "\n".join(b[4] for b in blocks if isinstance(b[4], str) and b[4].strip())
-        if len((txt or "").strip()) < 40:  # fallback si la page est quasi vide
+        if len((txt or "").strip()) < 40:
             txt = page.get_text("text")
         txt = unicodedata.normalize("NFKC", (txt or "")).replace("\x00", "")
         pages.append(txt)
@@ -64,24 +67,22 @@ def extract_pdf_text_sorted(pdf_path: str) -> str:
     return "\n\n".join(pages)
 
 def tidy_text(s: str) -> str:
-    """Nettoie artefacts usuels."""
-    import re, unicodedata
+    import unicodedata
     s = unicodedata.normalize("NFKC", s or "")
     s = s.replace("\u200b", "").replace("\x00", "")
-    s = re.sub(r"[^\S\r\n]+", " ", s)               # espaces multiples -> 1
-    s = re.sub(r"[-_]{4,}", "—", s)                 # longues suites de -/_ -> tiret cadratin
-    s = re.sub(r"\b(\w{2,})(?:\W+\1){7,}\b", r"\1", s, flags=re.IGNORECASE)  # répétitions folles
-    s = re.sub(r"\n{3,}", "\n\n", s)                # lignes vides multiples
+    s = re.sub(r"[^\S\r\n]+", " ", s)
+    s = re.sub(r"[-_]{4,}", "—", s)
+    s = re.sub(r"\b(\w{2,})(?:\W+\1){7,}\b", r"\1", s, flags=re.IGNORECASE)
+    s = re.sub(r"\n{3,}", "\n\n", s)
     return s.strip()
 
 def simple_summarizer(text: str, max_sentences: int = 3) -> str:
-    import re
     sentences = re.split(r'(?<=[.!?。？])\s+', (text or "").strip())
     return " ".join(sentences[:max_sentences])
 
 # ---------- Mini-RAG helpers ----------
 def _normalize(s: str) -> str:
-    import unicodedata, re
+    import unicodedata
     s = unicodedata.normalize("NFKD", s or "").encode("ascii", "ignore").decode("ascii")
     s = s.lower()
     s = re.sub(r"[^a-z0-9\s]", " ", s)
@@ -92,12 +93,11 @@ STOPWORDS = set("""
 the a an and or of for to in into with without within over under than that this these those be is are was were been being
 on at by from as if else but not no nor so such it its itself your you we our us i me my they them their themselves he she
 him her his hers do does did done doing have has had having would could should may might can will just about around very
-de la le les un une des du au aux et ou dans sur par pour sans sous plus que qui quoi dont où lorsque lorsqué ainsi donc
-est sont était étaient être avoir avait avez avons avoirai
+de la le les un une des du au aux et ou dans sur par pour sans sous plus que qui quoi dont ou où lorsque ainsi donc
+est sont etait etaient etre avoir avait avez avons
 """.split())
 
 def make_chunks(text: str, chunk_chars: int = 1200, overlap: int = 120):
-    """Découpe par paragraphes, regroupe jusqu’à ~chunk_chars, overlap entre blocs."""
     paras = [p.strip() for p in text.split("\n") if p.strip()]
     chunks, cur = [], ""
     for p in paras:
@@ -106,60 +106,112 @@ def make_chunks(text: str, chunk_chars: int = 1200, overlap: int = 120):
         else:
             if cur:
                 chunks.append(cur)
-            # chevauchement simple
-            cur_tail = cur[-overlap:] if cur else ""
-            cur = (cur_tail + "\n" + p).strip()
+            tail = cur[-overlap:] if cur else ""
+            cur = (tail + "\n" + p).strip()
     if cur:
         chunks.append(cur)
-    # version normalisée
     return [{"text": c, "norm": _normalize(c)} for c in chunks]
 
+def _fuzzy_hit(word: str, token: str) -> bool:
+    if abs(len(word) - len(token)) > 2:
+        return False
+    return SequenceMatcher(None, word, token).ratio() >= 0.84
+
 def score_chunk(norm_chunk: str, norm_query: str) -> float:
-    c_words = norm_chunk.split()
-    q_words = [w for w in norm_query.split() if w not in STOPWORDS and len(w) > 2]
-    if not q_words:
+    c_tokens = norm_chunk.split()
+    q_tokens = [w for w in norm_query.split() if w not in STOPWORDS and len(w) > 2]
+    if not q_tokens:
         return 0.0
     score = 0.0
-    for w in q_words:
-        score += c_words.count(w)
-    # petit bonus si mot rare (long)
-    score += sum(0.3 for w in q_words if len(w) >= 7 and w in norm_chunk)
+    for w in q_tokens:
+        exact = c_tokens.count(w)
+        if exact:
+            score += exact * 1.0
+        else:
+            # fuzzy boost (ex: "euler" vs "eulet" OCR)
+            if any(_fuzzy_hit(w, t) for t in c_tokens):
+                score += 0.7
+    # bonus mots longs présents tels quels
+    for w in q_tokens:
+        if len(w) >= 7 and w in norm_chunk:
+            score += 0.3
     return score
 
-def select_passages(text: str, question: str, k: int = 5, max_chars: int = 12000) -> str:
+def select_passages(text: str, question: str, k: int = 6, max_chars: int = 12000) -> str:
     chunks = make_chunks(text)
     qn = _normalize(question)
-    ranked = sorted(
-        chunks,
-        key=lambda ch: score_chunk(ch["norm"], qn),
-        reverse=True,
-    )[: max(1, k)]
+    ranked = sorted(chunks, key=lambda ch: score_chunk(ch["norm"], qn), reverse=True)[:max(1, k)]
     ctx = "\n\n---\n\n".join(ch["text"] for ch in ranked)
     return ctx[:max_chars]
 
 # ---------- LLM calls ----------
-def smart_groq_summary(text: str) -> str:
+def smart_groq_summary_structured(text: str):
+    """
+    Demande une sortie JSON stricte; fallback en markdown si parsing échoue.
+    Renvoie (markdown_stable, sections_dict|None)
+    """
+    import openai
+    api_key = os.environ.get("GROQ_API_KEY", "")
+    if not api_key:
+        return "[Groq Error] No API key defined", None
+
+    model = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+    head = (text or "")[:7000]
+    sys = (
+        "You are an expert summarizer. Respond ONLY with a valid JSON object and nothing else. "
+        'Schema: {"executive_summary": "2-3 sentences", "key_points": ["..."], '
+        '"recommendations": ["..."], "remarks": "optional string"}'
+    )
+    user = (
+        "Summarize the PDF content (same language) for an executive. Be concise and professional. "
+        "Use short bullet items in arrays. No markdown, ONLY JSON.\n\n"
+        f"PDF content:\n{head}"
+    )
+    try:
+        client = openai.OpenAI(api_key=api_key, base_url="https://api.groq.com/openai/v1")
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[{"role": "system", "content": sys}, {"role": "user", "content": user}],
+            max_tokens=700,
+            temperature=0.2,
+        )
+        raw = (resp.choices[0].message.content or "").strip()
+        # enlève les fences éventuels
+        raw = raw.strip("` \n")
+        if raw.startswith("json"):
+            raw = raw[4:].strip()
+        data = json.loads(raw)
+        # construit un markdown stable et joli
+        md = []
+        if data.get("executive_summary"):
+            md.append("**Executive summary (2–3 sentences)**\n\n" + data["executive_summary"].strip())
+        if data.get("key_points"):
+            md.append("**Key points / Results**\n\n" + "\n".join(f"- {x}" for x in data["key_points"]))
+        if data.get("recommendations"):
+            md.append("**Recommendations**\n\n" + "\n".join(f"- {x}" for x in data["recommendations"]))
+        if data.get("remarks"):
+            md.append("**Other important remarks**\n\n" + data["remarks"].strip())
+        return "\n\n".join(md).strip(), data
+    except Exception as e:
+        # Fallback: markdown libre
+        return smart_groq_summary_fallback(text), None
+
+def smart_groq_summary_fallback(text: str) -> str:
     import openai
     api_key = os.environ.get("GROQ_API_KEY", "")
     if not api_key:
         return "[Groq Error] No API key defined"
-
     model = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
     head = (text or "")[:6000]
-
     prompt = (
         "Summarize this PDF document in the original language, professionally, as if explaining to an executive. "
         "Extract only the key information, main results, recommendations, and important insights for decision-making. "
-        "Use bullet or numbered lists for clarity.\n\n"
-        "Expected structure:\n"
-        "1. Executive summary (2-3 sentences)\n"
-        "2. Key points / Results (list)\n"
-        "3. Recommendations (list)\n"
-        "4. Other important remarks (optional)\n\n"
+        "Use explicit bold section titles exactly like these and keep them in this order:\n"
+        "**Executive summary (2–3 sentences)**, **Key points / Results**, **Recommendations**, **Other important remarks**.\n\n"
         f"PDF content:\n{head}"
     )
-
     try:
+        import openai
         client = openai.OpenAI(api_key=api_key, base_url="https://api.groq.com/openai/v1")
         resp = client.chat.completions.create(
             model=model,
@@ -167,7 +219,7 @@ def smart_groq_summary(text: str) -> str:
                 {"role": "system", "content": "You are an expert at summarizing professional and academic documents in all languages."},
                 {"role": "user", "content": prompt},
             ],
-            max_tokens=600,
+            max_tokens=650,
             temperature=0.2,
         )
         return (resp.choices[0].message.content or "").strip()
@@ -180,11 +232,10 @@ def smart_groq_qa(context: str, question: str) -> str:
     if not api_key:
         return "[Groq Error] No API key defined"
     model = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
-
     user = (
         "Using ONLY the provided PDF excerpts, answer the question accurately. "
-        "Quote short snippets with “…” when useful and mention the section/page cues present in the excerpts if any. "
-        "If the context does not contain the answer, say you cannot find it in the provided passages.\n\n"
+        "Quote very short snippets with “…” and mention any visible page/section cues if present. "
+        "If the answer is not in the excerpts, say you cannot find it in the provided passages.\n\n"
         f"Question: {question}\n\n"
         f"PDF Excerpts:\n{context}"
     )
@@ -196,7 +247,7 @@ def smart_groq_qa(context: str, question: str) -> str:
                 {"role": "system", "content": "You are a careful assistant that answers from given context only."},
                 {"role": "user", "content": user},
             ],
-            max_tokens=600,
+            max_tokens=700,
             temperature=0.2,
         )
         return (resp.choices[0].message.content or "").strip()
@@ -208,7 +259,7 @@ def smart_groq_qa(context: str, question: str) -> str:
 def ping():
     return {"pong": True, "model": os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")}
 
-# ---------- Auth check ----------
+# ---------- Auth ----------
 @app.get("/auth/check")
 def auth_check(request: Request):
     return {"admin": is_admin(request)}
@@ -221,9 +272,8 @@ def premium_check(request: Request):
 @app.post("/api/summarize")
 async def summarize_pdf(request: Request, file: UploadFile = File(...)):
     """
-    Upload PDF -> extract -> tidy -> simple + AI summary.
-    - Stocke texte + chunks en mémoire (doc_id) pour le Q&A
-    - Bypass paywall si admin OU premium
+    Upload PDF -> extract -> tidy -> JSON-structured summary (fallback markdown).
+    Stocke texte + chunks pour Q&A.
     """
     tmp_path = None
     try:
@@ -232,12 +282,11 @@ async def summarize_pdf(request: Request, file: UploadFile = File(...)):
             tmp.write(content)
             tmp_path = tmp.name
 
-        # Compte pages
+        # pages
         doc = fitz.open(tmp_path)
         nb_pages = doc.page_count
         doc.close()
 
-        # Extraction robuste + nettoyage
         raw_text = extract_pdf_text_sorted(tmp_path)
         full_text = tidy_text(raw_text)
         nb_words = len(full_text.split())
@@ -259,11 +308,11 @@ async def summarize_pdf(request: Request, file: UploadFile = File(...)):
                 status_code=402,
             )
 
-        # Résumés
-        summary = simple_summarizer(full_text)
-        ai_summary = smart_groq_summary(full_text)
+        # Résumés (stables)
+        ai_md, ai_sections = smart_groq_summary_structured(full_text)
+        simple = simple_summarizer(full_text)
 
-        # Stockage + chunks pour RAG
+        # Stockage + chunks
         doc_id = uuid.uuid4().hex
         DOC_STORE[doc_id] = {
             "text": full_text,
@@ -273,8 +322,9 @@ async def summarize_pdf(request: Request, file: UploadFile = File(...)):
         }
 
         return {
-            "summary": summary,
-            "ai_summary": ai_summary,
+            "summary": simple,
+            "ai_summary": ai_md,          # markdown stable
+            "ai_sections": ai_sections,   # (optionnel) JSON structuré
             "nb_pages": nb_pages,
             "nb_words": nb_words,
             "paywall": False,
@@ -297,8 +347,8 @@ async def summarize_pdf(request: Request, file: UploadFile = File(...)):
 async def ask_pdf(request: Request, payload: dict):
     """
     Q&A premium/admin:
-    - headers: x-admin-token / x-premium-token
-    - body: {"question": str, "doc_id": str (optionnel), "context_hint": str (optionnel)}
+    headers: x-admin-token / x-premium-token
+    body: {"question": str, "doc_id": str (optionnel), "context_hint": str (optionnel)}
     """
     admin_ok = is_admin(request)
     premium_ok = is_premium(request)
@@ -314,8 +364,7 @@ async def ask_pdf(request: Request, payload: dict):
 
     context = ""
     if doc_id and doc_id in DOC_STORE:
-        # Récupère les meilleurs passages du doc en mémoire
-        context = select_passages(DOC_STORE[doc_id]["text"], question, k=6, max_chars=12000)
+        context = select_passages(DOC_STORE[doc_id]["text"], question, k=8, max_chars=14000)
     elif context_hint:
         context = context_hint
 
